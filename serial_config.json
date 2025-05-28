@@ -1,0 +1,40 @@
+{
+  "default_settings": {
+    "baudrate": 9600,
+    "timeout": 1.0,
+    "encoding": "utf-8",
+    "bytesize": 8,
+    "parity": "N",
+    "stopbits": 1
+  },
+  "common_baudrates": [
+    1200,
+    2400,
+    4800,
+    9600,
+    19200,
+    38400,
+    57600,
+    115200,
+    230400,
+    460800,
+    921600
+  ],
+  "data_formats": {
+    "csv": {
+      "enabled": true,
+      "delimiter": ",",
+      "include_header": true
+    },
+    "json": {
+      "enabled": true,
+      "indent": 2,
+      "ensure_ascii": false
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "serial_data.log",
+    "format": "%(asctime)s - %(levelname)s - %(message)s"
+  }
+}

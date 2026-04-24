@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI交易器 - 实时交易大屏</title>
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico?v={{ app_version }}">
+    <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+</head>
+<body class="trading-dashboard">
+    <!-- 主题切换按钮 -->
+    <div class="theme-toggle" id="themeToggle">
+        <i class="bi bi-sun-fill"></i>
+    </div>
+
+    <!-- 顶部币种价格栏 -->
+    <div class="top-ticker">
+        <div class="ticker-container" id="tickerContainer">
+            <!-- 动态加载币种价格 -->
+        </div>
+        <div class="ticker-info">
+            <span id="totalAccountValue">总账户价值: $0.00</span>
+            <span id="dailyPnl" class="pnl-positive">+$0.00</span>
+        </div>
+    </div>
+
+    <!-- 主内容区 -->
+    <div class="dashboard-main">
+        <!-- 左侧：收益曲线图 -->
+        <div class="chart-section">
+            <div class="chart-header">
+                <div class="chart-title">
+                    <h2>收益曲线</h2>
+                    <div class="chart-filters">
+                        <button class="filter-btn active" data-period="1D">1天</button>
+                        <button class="filter-btn" data-period="1W">1周</button>
+                        <button class="filter-btn" data-period="1M">1月</button>
+                        <button class="filter-btn" data-period="3M">3月</button>
+                        <button class="filter-btn" data-period="ALL">全部</button>
+                    </div>
+                </div>
+                <div class="chart-legend" id="chartLegend">
+                    <!-- 动态加载图例 -->
+                </div>
+            </div>
+            <div class="chart-container">
+                <div id="performanceChart" style="width: 100%; height: 500px;"></div>
+            </div>
+        </div>
+
+        <!-- 右侧：双栏布局 -->
+        <div class="right-panel">
+            <!-- WINNING MODEL -->
+            <div class="winning-model-section">
+                <div class="winning-model">
+                    <div class="winning-icon">🏆</div>
+                    <div class="winning-info">
+                        <div class="winning-label">WINNING MODEL</div>
+                        <div class="winning-name" id="winningModelName">-</div>
+                    </div>
+                    <div class="winning-stats">
+                        <div class="winning-stat">
+                            <div class="stat-label">TOTAL EQUITY</div>
+                            <div class="stat-value" id="winningModelEquity">$0</div>
+                        </div>
+                        <div class="winning-stat">
+                            <div class="stat-label">ACTIVE POSITIONS</div>
+                            <div class="stat-value" id="winningModelPositions">0</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 最新交易 -->
+            <div class="trades-section">
+                <div class="trades-header">
+                    <h3>最新交易</h3>
+                    <span class="trades-count" id="tradesCount">显示最近100条交易</span>
+                </div>
+                <div class="trades-list" id="tradesList">
+                    <!-- 动态加载交易记录 -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 排行榜 -->
+    <div class="leaderboards-section">
+        <div class="leaderboards-container">
+
+            <!-- 标签页切换 -->
+            <div class="stats-tabs">
+                <button class="stats-tab active" data-tab="overall">OVERALL STATS</button>
+                <button class="stats-tab" data-tab="advanced">ADVANCED ANALYTICS</button>
+            </div>
+
+            <!-- OVERALL STATS 内容 -->
+            <div class="stats-content active" id="overallStats">
+                <div class="stats-table-wrapper">
+                    <table class="stats-table">
+                        <thead>
+                            <tr>
+                                <th>排名</th>
+                                <th>模型</th>
+                                <th>收益率 ↓</th>
+                                <th>账户价值</th>
+                                <th>总盈亏</th>
+                                <th>手续费</th>
+                                <th>胜率</th>
+                                <th>最大盈利</th>
+                                <th>最大亏损</th>
+                                <th>夏普比率</th>
+                                <th>交易次数</th>
+                            </tr>
+                        </thead>
+                        <tbody id="overallStatsBody">
+                            <!-- 动态加载 -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- ADVANCED ANALYTICS 内容 -->
+            <div class="stats-content" id="advancedAnalytics">
+                <div class="stats-table-wrapper">
+                    <table class="stats-table">
+                        <thead>
+                            <tr>
+                                <th>排名</th>
+                                <th>模型</th>
+                                <th>夏普比率</th>
+                                <th>索提诺比率</th>
+                                <th>卡玛比率</th>
+                                <th>最大回撤</th>
+                                <th>波动率</th>
+                                <th>平均盈利</th>
+                                <th>平均亏损</th>
+                                <th>盈亏比</th>
+                                <th>交易次数</th>
+                            </tr>
+                        </thead>
+                        <tbody id="advancedAnalyticsBody">
+                            <!-- 动态加载 -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 登录/控制面板按钮（右下角） -->
+    <div class="floating-login" id="floatingAction">
+        <a href="/login" class="btn-login" id="loginBtn">
+            <i class="bi bi-box-arrow-in-right"></i>
+            <span>登录 / 注册</span>
+        </a>
+        <a href="/dashboard" class="btn-login" id="dashboardBtn" style="display: none;">
+            <i class="bi bi-speedometer2"></i>
+            <span>返回控制台</span>
+        </a>
+    </div>
+
+    <!-- 页脚：原项目致敬 - 自动隐藏 -->
+    <footer class="page-footer" id="pageFooter">
+        <div class="footer-content">
+            <span class="footer-text">基于开源项目</span>
+            <a href="https://github.com/chadyi/AITradeGame.git" target="_blank" class="footer-link" title="访问原项目">
+                <i class="bi bi-github"></i>
+                <span>AITradeGame</span>
+            </a>
+            <span class="footer-text">修改</span>
+        </div>
+    </footer>
+
+    <script src="/static/home.js?v={{ app_version }}"></script>
+</body>
+</html>
+

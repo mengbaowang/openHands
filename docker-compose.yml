@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  web:
+    build: .
+    container_name: ai-trade-simulator
+    ports:
+      - "35008:35008"
+    volumes:
+      - ./data:/app/data
+    environment:
+      # 数据库配置
+      - DATABASE_PATH=/app/data/trading_bot.db
+
+      # 服务器配置
+      - HOST=0.0.0.0
+      - PORT=35008
+      - DEBUG=False
+
+      # 安全配置（生产环境必须修改）
+      - SECRET_KEY=${SECRET_KEY:-change-this-secret-key-in-production}
+
+      # 交易配置
+      - AUTO_TRADING=True
+      - TRADING_INTERVAL=180
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:35008/api/market/prices', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+

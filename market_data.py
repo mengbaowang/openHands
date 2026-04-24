@@ -19,6 +19,7 @@ class MarketDataFetcher:
         self.coingecko_base_url = config.COINGECKO_API_URL
         self.coincap_base_url = "https://api.coincap.io/v2"
         self.cryptocompare_base_url = "https://min-api.cryptocompare.com/data"
+        self.okx_base_url = "https://www.okx.com/api/v5"
 
         # Symbol mappings
         self.binance_symbols = config.BINANCE_SYMBOLS
@@ -30,6 +31,14 @@ class MarketDataFetcher:
             'BNB': 'binance-coin',
             'XRP': 'xrp',
             'DOGE': 'dogecoin'
+        }
+        self.okx_symbols = {
+            'BTC': 'BTC-USDT',
+            'ETH': 'ETH-USDT',
+            'SOL': 'SOL-USDT',
+            'BNB': 'BNB-USDT',
+            'XRP': 'XRP-USDT',
+            'DOGE': 'DOGE-USDT'
         }
 
         # Cache settings
@@ -48,7 +57,8 @@ class MarketDataFetcher:
             'binance': 0.5,      # Binance很稳定，0.5秒即可
             'coingecko': 10.0,   # CoinGecko免费版限流严重，10秒间隔
             'coincap': 2.0,      # CoinCap中等限流
-            'cryptocompare': 2.0 # CryptoCompare中等限流
+            'cryptocompare': 2.0, # CryptoCompare中等限流
+            'okx': 1.0           # OKX中等限流
         }
     
     def _rate_limit(self, source: str):
@@ -99,9 +109,14 @@ class MarketDataFetcher:
             if time.time() - self._cache_time[cache_key] < self._cache_duration:
                 return self._cache[cache_key]
 
-        # Try multiple sources in order
+        # 1. 优先使用 OKX（如果启用）
         prices = None
-
+        if config.TRADING_MODE == 'okx_demo':
+            prices = self._get_prices_from_okx(coins)
+            if prices and len(prices) == len(coins):
+                self._cache[cache_key] = prices
+                self._cache_time[cache_key] = time.time()
+                return prices
         # 1. Try Binance (fastest, most reliable)
         prices = self._get_prices_from_binance(coins)
         if prices and len(prices) == len(coins):
@@ -276,6 +291,50 @@ class MarketDataFetcher:
             print(f"[WARN] CryptoCompare API failed: {e}")
             return None
     
+    def _get_prices_from_okx(self, coins: List[str]) -> Optional[Dict[str, float]]:
+        """从 OKX API 获取实时价格（优先使用）"""
+        try:
+            self._rate_limit('okx')
+            
+            # 获取所有产品的行情
+            inst_ids = [self.okx_symbols.get(coin) for coin in coins if coin in self.okx_symbols]
+            if not inst_ids:
+                return None
+            
+            # 查询多个产品行情
+            inst_type = 'SPOT'  # 现货
+            response = requests.get(
+                f"{self.okx_base_url}/market/tickers",
+                params={
+                    'instType': inst_type,
+                    'instId': ','.join(inst_ids)
+                },
+                timeout=5
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get('code') != '0':
+                print(f"[WARN] OKX API error: {data.get('msg')}")
+                return None
+            
+            prices = {}
+            for item in data.get('data', []):
+                inst_id = item.get('instId')
+                # 反向映射到币种
+                for coin, okx_symbol in self.okx_symbols.items():
+                    if okx_symbol == inst_id:
+                        prices[coin] = {
+                            'price': float(item.get('last', 0)),
+                            'change_24h': float(item.get('open24h', 0))
+                        }
+                        break
+            
+            return prices if prices else None
+        except Exception as e:
+            print(f"[WARN] OKX API failed: {e}")
+            return None
+
     def get_market_data(self, coin: str) -> Dict:
         """Get detailed market data from CoinGecko"""
         coin_id = self.coingecko_mapping.get(coin, coin.lower())
@@ -536,4 +595,3 @@ class MarketDataFetcher:
         mean = sum(prices) / len(prices)
         variance = sum((p - mean) ** 2 for p in prices) / len(prices)
         return variance ** 0.5
-

@@ -1,5 +1,5 @@
 """
-AI交易模拟器 - 统一配置管理
+AI交易器 - 统一配置管理
 遵循DRY和OCP原则，所有配置集中管理
 使用 .env 文件管理环境变量，避免配置混乱
 """
@@ -43,12 +43,30 @@ COINGECKO_MAPPING = {
     'XRP': 'ripple',
     'DOGE': 'dogecoin'
 }
+# OKX交易对映射（新增）
+OKX_SYMBOLS = {
+    'BTC': 'BTC-USDT-SWAP',  # 永续合约
+    'ETH': 'ETH-USDT-SWAP',
+    'SOL': 'SOL-USDT-SWAP',
+    'BNB': 'BNB-USDT-SWAP',
+    'XRP': 'XRP-USDT-SWAP',
+    'DOGE': 'DOGE-USDT-SWAP'
+}
 
+# 交易模式切换 simulation(模拟交易） | okx_demo(OKX模拟盘）
+TRADING_MODE = os.getenv('TRADING_MODE', 'simulation')
 # ============ 市场数据配置 ============
 MARKET_API_CACHE_DURATION = 5  # 秒
 BINANCE_API_URL = 'https://api.binance.com/api/v3'
 COINGECKO_API_URL = 'https://api.coingecko.com/api/v3'
+OKX_API_URL = 'https://www.okx.com/api/v5'
 
+
+# OKX API 配置
+OKX_API_KEY = os.getenv('OKX_API_KEY', 'cfdb8f59-d2a4-4be1-8675-6f16e19e22de')
+OKX_API_SECRET = os.getenv('OKX_API_SECRET', '293C6B25518060439A29E0ABBE1CD2E9')
+OKX_PASSPHRASE = os.getenv('OKX_PASSPHRASE', 'Mengbaowang666.')
+OKX_FLAG = '1'  # 1=模拟盘, 0=实盘
 # ============ 前端刷新频率 ============
 MARKET_REFRESH_INTERVAL = 5000  # 毫秒（修复了原来的错误35008）
 PORTFOLIO_REFRESH_INTERVAL = 10000  # 毫秒
@@ -85,18 +103,3 @@ RATE_LIMIT_TRADING = "10 per minute"
 WEBSOCKET_ENABLED = True
 WEBSOCKET_PING_INTERVAL = 25
 WEBSOCKET_PING_TIMEOUT = 60
-
-# ============ Linux DO OAuth配置 ============
-# Linux DO Connect OAuth 2.0 配置
-LINUXDO_CLIENT_ID = os.getenv('LINUXDO_CLIENT_ID', '你的Client ID')
-LINUXDO_CLIENT_SECRET = os.getenv('LINUXDO_CLIENT_SECRET', '你的Client Secret')
-LINUXDO_REDIRECT_URI = os.getenv('LINUXDO_REDIRECT_URI', 'https://trade.easy2ai.com/api/auth/callback')
-
-# Linux DO OAuth 端点
-LINUXDO_AUTHORIZE_URL = 'https://connect.linux.do/oauth2/authorize'
-LINUXDO_TOKEN_URL = 'https://connect.linux.do/oauth2/token'
-LINUXDO_USERINFO_URL = 'https://connect.linux.do/api/user'  # 修正：使用正确的用户信息端点
-
-# Linux DO 最低信任等级要求
-LINUXDO_MIN_TRUST_LEVEL = 1
-

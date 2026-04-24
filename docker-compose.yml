@@ -20,11 +20,6 @@ services:
       # 安全配置（生产环境必须修改）
       - SECRET_KEY=${SECRET_KEY:-change-this-secret-key-in-production}
 
-      # Linux DO OAuth配置（可选）
-      - LINUX_DO_CLIENT_ID=${LINUX_DO_CLIENT_ID:-}
-      - LINUX_DO_CLIENT_SECRET=${LINUX_DO_CLIENT_SECRET:-}
-      - LINUX_DO_REDIRECT_URI=${LINUX_DO_REDIRECT_URI:-}
-
       # 交易配置
       - AUTO_TRADING=True
       - TRADING_INTERVAL=180

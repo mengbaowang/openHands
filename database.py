@@ -3,6 +3,7 @@ Database management module
 """
 import sqlite3
 import json
+import config
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -218,85 +219,6 @@ class Database:
         conn.commit()
         conn.close()
     
-    def get_portfolio(self, model_id: int, current_prices: Dict = None) -> Dict:
-        """Get portfolio with positions and P&L
-        
-        Args:
-            model_id: Model ID
-            current_prices: Current market prices {coin: price} for unrealized P&L calculation
-        """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # Get positions
-        cursor.execute('''
-            SELECT * FROM portfolios WHERE model_id = ? AND quantity > 0
-        ''', (model_id,))
-        positions = [dict(row) for row in cursor.fetchall()]
-        
-        # Get initial capital
-        cursor.execute('SELECT initial_capital FROM models WHERE id = ?', (model_id,))
-        initial_capital = cursor.fetchone()['initial_capital']
-        
-        # Calculate realized P&L (sum of all trade P&L)
-        cursor.execute('''
-            SELECT COALESCE(SUM(pnl), 0) as total_pnl FROM trades WHERE model_id = ?
-        ''', (model_id,))
-        realized_pnl = cursor.fetchone()['total_pnl']
-        
-        # Calculate margin used
-        margin_used = sum([p['quantity'] * p['avg_price'] / p['leverage'] for p in positions])
-        
-        # Calculate unrealized P&L (if prices provided)
-        unrealized_pnl = 0
-        if current_prices:
-            for pos in positions:
-                coin = pos['coin']
-                if coin in current_prices:
-                    current_price = current_prices[coin]
-                    entry_price = pos['avg_price']
-                    quantity = pos['quantity']
-                    
-                    # Add current price to position
-                    pos['current_price'] = current_price
-                    
-                    # Calculate position P&L
-                    if pos['side'] == 'long':
-                        pos_pnl = (current_price - entry_price) * quantity
-                    else:  # short
-                        pos_pnl = (entry_price - current_price) * quantity
-                    
-                    pos['pnl'] = pos_pnl
-                    unrealized_pnl += pos_pnl
-                else:
-                    pos['current_price'] = None
-                    pos['pnl'] = 0
-        else:
-            for pos in positions:
-                pos['current_price'] = None
-                pos['pnl'] = 0
-        
-        # Cash = initial capital + realized P&L - margin used
-        cash = initial_capital + realized_pnl - margin_used
-        
-        # Position value = quantity * entry price (not margin!)
-        positions_value = sum([p['quantity'] * p['avg_price'] for p in positions])
-        
-        # Total account value = initial capital + realized P&L + unrealized P&L
-        total_value = initial_capital + realized_pnl + unrealized_pnl
-        
-        conn.close()
-        
-        return {
-            'model_id': model_id,
-            'cash': cash,
-            'positions': positions,
-            'positions_value': positions_value,
-            'margin_used': margin_used,
-            'total_value': total_value,
-            'realized_pnl': realized_pnl,
-            'unrealized_pnl': unrealized_pnl
-        }
     
     def close_position(self, model_id: int, coin: str, side: str = 'long'):
         """Close position"""
@@ -428,3 +350,215 @@ class Database:
         conn.close()
         return [dict(row) for row in rows]
 
+
+    # ============ OKX Portfolio Management ============
+    def get_portfolio(self, model_id: int, current_prices: Dict = None) -> Dict:
+        """
+        Get portfolio with positions and P&L
+        根据 TRADING_MODE 决定从哪里获取数据
+        Args:
+            model_id: Model ID
+            current_prices: Current market prices {coin: price} for unrealized P&L calculation
+        Returns:
+            dict: Portfolio information
+        """
+        # 根据 TRADING_MODE 决定从哪里获取数据
+        if config.TRADING_MODE == 'okx_demo':
+            # OKX 模式：从 OKX API 获取
+            return self._get_portfolio_from_okx(model_id, current_prices)
+        else:
+            # 模拟模式：从本地数据库获取
+            return self._get_portfolio_from_local(model_id, current_prices)
+
+    def _get_portfolio_from_local(self, model_id: int, current_prices: Dict = None) -> Dict:
+        """
+        从本地数据库获取投资组合（模拟模式）
+        Args:
+            model_id: Model ID
+            current_prices: Current market prices
+        Returns:
+            dict: Portfolio information
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Get positions
+        cursor.execute('''
+            SELECT * FROM portfolios WHERE model_id = ? AND quantity > 0
+        ''', (model_id,))
+        positions = [dict(row) for row in cursor.fetchall()]
+        
+        # Get initial capital
+        cursor.execute('SELECT initial_capital FROM models WHERE id = ?', (model_id,))
+        initial_capital = cursor.fetchone()['initial_capital']
+        
+        # Calculate realized P&L (sum of all trade P&L)
+        cursor.execute('''
+            SELECT COALESCE(SUM(pnl), 0) as total_pnl FROM trades WHERE model_id = ?
+        ''', (model_id,))
+        realized_pnl = cursor.fetchone()['total_pnl']
+        
+        # Calculate margin used
+        margin_used = sum([p['quantity'] * p['avg_price'] / p['leverage'] for p in positions])
+        
+        # Calculate unrealized P&L (if prices provided)
+        unrealized_pnl = 0
+        if current_prices:
+            for pos in positions:
+                coin = pos['coin']
+                if coin in current_prices:
+                    current_price = current_prices[coin]
+                    entry_price = pos['avg_price']
+                    quantity = pos['quantity']
+                    
+                    # Add current price to position
+                    pos['current_price'] = current_price
+                    
+                    # Calculate position P&L
+                    if pos['side'] == 'long':
+                        pos_pnl = (current_price - entry_price) * quantity
+                    else:  # short
+                        pos_pnl = (entry_price - current_price) * quantity
+                    pos['pnl'] = pos_pnl
+                    unrealized_pnl += pos_pnl
+                else:
+                    pos['current_price'] = None
+                    pos['pnl'] = 0
+        else:
+            for pos in positions:
+                pos['current_price'] = None
+                pos['pnl'] = 0
+        
+        # Cash = initial capital + realized P&L - margin used
+        cash = initial_capital + realized_pnl - margin_used
+        
+        # Position value = quantity * entry price (not margin!)
+        positions_value = sum([p['quantity'] * p['avg_price'] for p in positions])
+        
+        # Total account value = initial capital + realized P&L + unrealized P&L
+        total_value = initial_capital + realized_pnl + unrealized_pnl
+        
+        conn.close()
+        
+        return {
+            'model_id': model_id,
+            'cash': cash,
+            'positions': positions,
+            'positions_value': positions_value,
+            'margin_used': margin_used,
+            'total_value': total_value,
+            'realized_pnl': realized_pnl,
+            'unrealized_pnl': unrealized_pnl
+        }
+
+    def _get_portfolio_from_okx(self, model_id: int, current_prices: Dict = None) -> Dict:
+        """从 OKX API 获取投资组合（OKX 模式）"""
+        # 导入 OKXTrader
+        try:
+            from okx_trader import OKXTrader
+        except ImportError:
+            print("[ERROR] okx_trader 导入失败，降级到本地数据库")
+            return self._get_portfolio_from_local(model_id, current_prices)
+        
+        # 创建 OKXTrader 实例
+        try:
+            okx_trader = OKXTrader()
+        except Exception as e:
+            print(f"[ERROR] OKXTrader 初始化失败：{e}，降级到本地数据库")
+            return self._get_portfolio_from_local(model_id, current_prices)
+        
+        try:
+            # 获取账户余额
+            balance_data = okx_trader.get_balance()
+            if not balance_data or 'error' in balance_data:
+                print(f"[WARN] OKX 账户余额获取失败: {balance_data.get('error', '未知错误')}")
+                return self._get_portfolio_from_local(model_id, current_prices)
+            
+            details = balance_data.get('details', [])
+            
+            # 1. 计算账户总值（所有币种的等值 USDT 之和）
+            total_value = 0
+            usdt_available = 0
+            frozen_margin = 0
+            wallet_balances = {}
+            
+            for item in details:
+                ccy = item.get('ccy')
+                eq_usd = float(item.get('eqUsd', 0))
+                
+                if eq_usd > 0:
+                    total_value += eq_usd
+                
+                if ccy == 'USDT':
+                    usdt_available = float(item.get('availEq', 0))
+                    frozen_margin = float(item.get('frozenBal', 0))
+                
+                # 记录钱包余额
+                wallet_balances[ccy] = {
+                    'total': float(item.get('eq', 0)),
+                    'available': float(item.get('availEq', 0)),
+                    'frozen': float(item.get('frozenBal', 0))
+                }
+            
+            # 2. 现金价值 = USDT 可用余额
+            cash = usdt_available
+            
+            # print(f"[DEBUG] 账户总值: {total_value:.2f} USDT")
+            # print(f"[DEBUG] 现金价值: {cash:.2f} USDT")
+            # print(f"[DEBUG] 已用保证金: {frozen_margin:.2f} USDT")
+            
+            # 3. 获取合约持仓
+            positions_data = okx_trader.get_positions()
+            if 'error' in positions_data:
+                positions_data = []
+            
+            positions_value = 0
+            pos_details = []
+            
+            for pos in positions_data:
+                coin = pos['coin']
+                if coin in current_prices:
+                    position_value = pos['size'] * current_prices[coin]
+                    positions_value += position_value
+                    
+                    db_pos = self.get_position(model_id, coin, pos['side'])
+                    pos_details.append({
+                        'coin': coin,
+                        'side': pos['side'],
+                        'quantity': pos['size'],
+                        'avg_price': pos['avg_price'],
+                        'leverage': pos['leverage'],
+                        'stop_loss': db_pos.get('stop_loss') if db_pos else None,
+                        'take_profit': db_pos.get('take_profit') if db_pos else None,
+                        'value': position_value
+                    })
+            
+            return {
+                'cash': cash,
+                'positions': pos_details,
+                'total_value': total_value,
+                'positions_value': positions_value,
+                'frozen_margin': frozen_margin,
+                'wallet_balances': wallet_balances
+            }
+            
+        except Exception as e:
+            print(f"[ERROR] 获取 OKX 投资组合失败：{e}")
+            import traceback
+            traceback.print_exc()
+            print(f"[WARN] 降级到本地数据库获取投资组合")
+            return self._get_portfolio_from_local(model_id, current_prices)
+
+    # ============ Position Management ============
+    def get_position(self, model_id: int, coin: str, side: str) -> Optional[Dict]:
+        """获取指定持仓（用于止盈止损）"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT stop_loss, take_profit
+            FROM portfolios
+            WHERE model_id = ? AND coin = ? AND side = ?
+        ''', (model_id, coin, side))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None

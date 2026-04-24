@@ -96,11 +96,11 @@ def _get_current_market_prices():
         prices_data = market_fetcher.get_current_prices(config.SUPPORTED_COINS)
         if not prices_data:
             # 所有API都失败且无缓存，返回空字典
-            print(f'[ERROR] No market data available - all APIs failed and no cache')
+            print(f'[ERROR] 未找到市场价格数据 - 所有API都失败且无缓存')
             return {}
         return {coin: prices_data[coin]['price'] for coin in prices_data if coin in prices_data}
     except Exception as e:
-        print(f'[ERROR] Failed to get market prices: {e}')
+        print(f'[ERROR] 获取市场价格失败: {e}')
         import traceback
         traceback.print_exc()
         return {}
@@ -210,102 +210,6 @@ def logout():
     clear_current_user()
     return jsonify({'message': '登出成功'})
 
-@app.route('/api/auth/linuxdo', methods=['GET'])
-def linuxdo_oauth():
-    """Linux DO OAuth 授权跳转"""
-    import urllib.parse
-
-    # 构建授权URL
-    params = {
-        'client_id': config.LINUXDO_CLIENT_ID,
-        'redirect_uri': config.LINUXDO_REDIRECT_URI,
-        'response_type': 'code',
-        'scope': 'user'  # 修正：使用正确的scope
-    }
-
-    auth_url = f"{config.LINUXDO_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}"
-
-    # 重定向到Linux DO授权页面
-    from flask import redirect
-    return redirect(auth_url)
-
-@app.route('/api/auth/callback', methods=['GET'])
-def linuxdo_callback():
-    """Linux DO OAuth 回调处理"""
-    import requests
-
-    # 获取授权码
-    code = request.args.get('code')
-    if not code:
-        return jsonify({'error': '授权失败，未获取到授权码'}), 400
-
-    try:
-        # 1. 用授权码换取access_token
-        token_data = {
-            'client_id': config.LINUXDO_CLIENT_ID,
-            'client_secret': config.LINUXDO_CLIENT_SECRET,
-            'code': code,
-            'grant_type': 'authorization_code',
-            'redirect_uri': config.LINUXDO_REDIRECT_URI
-        }
-
-        token_response = requests.post(config.LINUXDO_TOKEN_URL, data=token_data, timeout=10)
-        token_response.raise_for_status()
-        token_json = token_response.json()
-
-        access_token = token_json.get('access_token')
-        if not access_token:
-            return jsonify({'error': 'OAuth授权失败，未获取到access_token'}), 400
-
-        # 2. 用access_token获取用户信息
-        headers = {'Authorization': f'Bearer {access_token}'}
-        userinfo_response = requests.get(config.LINUXDO_USERINFO_URL, headers=headers, timeout=10)
-        userinfo_response.raise_for_status()
-        userinfo = userinfo_response.json()
-
-        # 3. 验证trust_level
-        trust_level = userinfo.get('trust_level', 0)
-        if trust_level < config.LINUXDO_MIN_TRUST_LEVEL:
-            return jsonify({
-                'error': f'您的信任等级为{trust_level}，需要达到{config.LINUXDO_MIN_TRUST_LEVEL}级才能登录'
-            }), 403
-
-        # 4. 获取用户信息
-        linuxdo_id = userinfo.get('id')
-        username = userinfo.get('username')
-        email = userinfo.get('email', '')
-
-        if not linuxdo_id or not username:
-            return jsonify({'error': 'OAuth授权失败，未获取到用户信息'}), 400
-
-        # 5. 查找或创建用户
-        # 使用linuxdo_id作为唯一标识
-        linuxdo_username = f'linuxdo_{linuxdo_id}'
-        user = db.get_user_by_username(linuxdo_username)
-
-        if not user:
-            # 创建新用户（Linux DO用户不需要密码）
-            password_hash = hash_password(f'linuxdo_oauth_{linuxdo_id}')  # 随机密码
-            user_id = db.create_user(linuxdo_username, password_hash, email)
-        else:
-            user_id = user['id']
-
-        # 6. 设置Session
-        set_current_user(user_id, linuxdo_username)
-
-        # 7. 重定向到首页或控制台
-        from flask import redirect
-        return redirect('/dashboard')
-
-    except requests.RequestException as e:
-        print(f'[ERROR] Linux DO OAuth failed: {e}')
-        return jsonify({'error': f'OAuth授权失败: {str(e)}'}), 500
-    except Exception as e:
-        print(f'[ERROR] Linux DO OAuth callback failed: {e}')
-        import traceback
-        traceback.print_exc()
-        return jsonify({'error': f'登录失败: {str(e)}'}), 500
-
 @app.route('/api/auth/me', methods=['GET'])
 @app.route('/api/user/info', methods=['GET'])
 def get_current_user():
@@ -359,6 +263,34 @@ def get_model(model_id):
 @app.route('/api/models', methods=['POST'])
 @login_required
 def add_model():
+
+
+    # 根据 TRADING_MODE 决定初始资金
+    if config.TRADING_MODE == 'okx_demo':
+        # OKX 模式：从 OKX API 获取初始余额
+        try:
+            from okx_trader import OKXTrader
+            okx_trader = OKXTrader()
+            balance_data = okx_trader.get_balance()
+            if balance_data and 'error' not in balance_data:
+                # 计算所有币种的总价值
+                balances = balance_data.get('balances', {})
+                initial_capital = 0.0
+                for ccy, bal in balances.items():
+                    initial_capital += bal.get('total', 0)
+                print(f"[INFO] OKX 模式：使用 OKX 余额作为初始资金: {initial_capital}")
+            else:
+                # 如果获取失败，使用用户输入的值
+                initial_capital = float(data.get('initial_capital', 10000))
+                print(f"[WARN] OKX 余额获取失败，使用用户输入值: {initial_capital}")
+        except Exception as e:
+            print(f"[ERROR] 获取 OKX 余额失败: {e}")
+            initial_capital = float(data.get('initial_capital', 10000))
+    else:
+        # 模拟模式：使用用户输入的初始资金
+        initial_capital = float(data.get('initial_capital', 10000))
+
+
     """创建新模型（需要登录）"""
     user_id = get_current_user_id()
     data = request.json
@@ -368,15 +300,14 @@ def add_model():
         api_key=data['api_key'],
         api_url=data['api_url'],
         model_name=data['model_name'],
-        initial_capital=float(data.get('initial_capital', 10000)),
-        system_prompt=data.get('system_prompt')  # 可选的自定义prompt
-    )
+        initial_capital=initial_capital,
+        system_prompt=data.get('system_prompt'))
 
     try:
         trading_engines[model_id] = _create_trading_engine(model_id)
-        print(f"[INFO] Model {model_id} ({data['name']}) initialized")
+        print(f"[INFO] 模型 {model_id} ({data['name']}) 初始化成功")
     except Exception as e:
-        print(f"[ERROR] Model {model_id} initialization failed: {e}")
+        print(f"[ERROR] 初始化模型 {model_id} 失败: {e}")
 
     return jsonify({'id': model_id, 'message': 'Model added successfully'})
 
@@ -412,10 +343,10 @@ def update_model(model_id):
             del trading_engines[model_id]
         trading_engines[model_id] = _create_trading_engine(model_id)
 
-        print(f"[INFO] Model {model_id} system_prompt updated")
+        print(f"[INFO] 模型 {model_id} 更新成功")
         return jsonify({'message': 'Model updated successfully'})
     except Exception as e:
-        print(f"[ERROR] Update model {model_id} failed: {e}")
+        print(f"[ERROR] 更新模型 {model_id} 失败: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/models/<int:model_id>', methods=['DELETE'])
@@ -436,10 +367,10 @@ def delete_model(model_id):
         if model_id in trading_engines:
             del trading_engines[model_id]
 
-        print(f"[INFO] Model {model_id} ({model_name}) deleted")
+        print(f"[INFO] 模型 {model_id} ({model_name}) 删除成功")
         return jsonify({'message': 'Model deleted successfully'})
     except Exception as e:
-        print(f"[ERROR] Delete model {model_id} failed: {e}")
+        print(f"[ERROR] 删除模型 {model_id} 失败: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/models/<int:model_id>/portfolio', methods=['GET'])
@@ -723,7 +654,7 @@ def get_top_coins():
 
         return jsonify(result)
     except Exception as e:
-        print(f'[ERROR] Failed to get top coins: {e}')
+        print(f'[ERROR] 获取顶部币种价格栏数据失败，异常信息: {e}')
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -766,7 +697,7 @@ def get_total_stats():
             'total_pnl': total_pnl
         })
     except Exception as e:
-        print(f'[ERROR] Failed to get total stats: {e}')
+        print(f'[ERROR] 获取全平台总统计数据失败，异常信息: {e}')
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -843,7 +774,7 @@ def get_detailed_leaderboard():
 
         return jsonify(leaderboard)
     except Exception as e:
-        print(f'[ERROR] Failed to get detailed leaderboard: {e}')
+        print(f'[ERROR] 获取详细排行榜数据失败，异常信息: {e}')
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -932,7 +863,7 @@ def get_advanced_analytics():
 
         return jsonify(analytics)
     except Exception as e:
-        print(f'[ERROR] Failed to get advanced analytics: {e}')
+        print(f'[ERROR] 获取高级分析数据失败，异常信息: {e}')
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -943,7 +874,7 @@ def get_performance_chart():
     try:
         # 获取时间筛选参数
         time_filter = request.args.get('timeFilter', 'all')
-        print(f'[DEBUG] Time filter: {time_filter}')
+        print(f'[DEBUG] 时间筛选参数: {time_filter}')
 
         # 计算时间范围
         from datetime import datetime, timedelta
@@ -963,7 +894,7 @@ def get_performance_chart():
 
         # 转换为UTC时间字符串用于数据库查询
         start_time_utc_str = start_time.strftime('%Y-%m-%d %H:%M:%S')
-        print(f'[DEBUG] Query start time (UTC): {start_time_utc_str}')
+        print(f'[DEBUG] 查询开始时间（UTC）: {start_time_utc_str}')
 
         # 获取排行榜前10名+倒数2名
         models = db.get_all_models()
@@ -1028,7 +959,7 @@ def get_performance_chart():
             ''', (model['model_id'], start_time_utc_str))
 
             history = cursor.fetchall()
-            print(f'[DEBUG] Model {model["model_name"]} (ID:{model["model_id"]}): {len(history)} data points after filtering (>= {start_time_utc_str})')
+            print(f'[DEBUG] 模型 {model["model_name"]} (ID:{model["model_id"]}): 过滤后数据点数量: {len(history)}')
 
             data_points = []
             for row in history:
@@ -1054,12 +985,12 @@ def get_performance_chart():
         try:
             btc_prices = market_fetcher.get_current_prices(['BTC'])
             if not btc_prices or 'BTC' not in btc_prices:
-                print('[ERROR] Cannot get BTC price for baseline - skipping BTC baseline')
+                print('[ERROR] 无法获取BTC价格，跳过BTC基准线')
                 btc_current_price = None
             else:
                 btc_current_price = btc_prices.get('BTC', {}).get('price')
         except Exception as e:
-            print(f'[ERROR] Failed to get BTC price: {e}')
+            print(f'[ERROR] 获取BTC价格失败，异常信息: {e}')
             btc_current_price = None
 
         # 获取BTC历史价格（从base_time开始，只使用真实数据）
@@ -1070,9 +1001,9 @@ def get_performance_chart():
                 if btc_historical and len(btc_historical) > 0:
                     btc_historical_data = btc_historical
                 else:
-                    print('[WARN] No BTC historical data available - cannot calculate baseline')
+                    print('[WARN] 无法获取BTC历史数据，无法计算BTC基准线收益')
             except Exception as e:
-                print(f'[ERROR] Failed to get BTC historical data: {e}')
+                print(f'[ERROR] 获取BTC历史数据失败，异常信息: {e}')
 
         # 只有在有真实BTC数据时才添加BTC基准线
         if btc_current_price and btc_historical_data:
@@ -1092,7 +1023,7 @@ def get_performance_chart():
                     filtered_btc_data.append(hist_point)
 
             if not filtered_btc_data:
-                print(f'[WARN] No BTC data after start time: {start_time_utc_str}')
+                print(f'[WARN] 无法获取在 {start_time_utc_str} 之后的BTC历史数据')
             else:
                 # 使用过滤后的最早价格作为初始价格
                 btc_initial_price = filtered_btc_data[0]['price']
@@ -1132,13 +1063,13 @@ def get_performance_chart():
                     'data': btc_baseline_data
                 })
         else:
-            print('[WARN] Skipping BTC baseline - no real market data available')
+            print('[WARN] 无法获取BTC历史数据，无法计算BTC基准线收益')
 
         conn.close()
 
         return jsonify(result)
     except Exception as e:
-        print(f'[ERROR] Failed to get performance chart: {e}')
+        print(f'[ERROR] 获取性能图表失败，异常信息: {e}')
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -1191,7 +1122,7 @@ def get_recent_trades():
         conn.close()
         return jsonify(trades)
     except Exception as e:
-        print(f'[ERROR] Failed to get recent trades: {e}')
+        print(f'[ERROR] 获取最近交易动态失败，异常信息: {e}')
         import traceback
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
@@ -1297,26 +1228,24 @@ def execute_trading(model_id):
         return jsonify({'error': str(e)}), 500
 
 def trading_loop():
-    print("[INFO] Trading loop started")
+    print("[INFO] 交易循环已启动")
     
     while auto_trading:
         try:
             if not trading_engines:
-                time.sleep(30)
+                time.sleep(30) # 等待30秒，确保模型初始化完成
                 continue
             
-            print(f"\n{'='*60}")
             print(f"[CYCLE] {get_current_beijing_time_str()}")  # 日志显示东八区时间
-            print(f"[INFO] Active models: {len(trading_engines)}")
-            print(f"{'='*60}")
+            print(f"[INFO] 当前交易模型数量: {len(trading_engines)}")
             
             for model_id, engine in list(trading_engines.items()):
                 try:
-                    print(f"\n[EXEC] Model {model_id}")
+                    print(f"\n[EXEC] 执行模型交易 {model_id}")
                     result = engine.execute_trading_cycle()
                     
                     if result.get('success'):
-                        print(f"[OK] Model {model_id} completed")
+                        print(f"[OK] 模型 {model_id} 执行成功")
                         if result.get('executions'):
                             for exec_result in result['executions']:
                                 signal = exec_result.get('signal', 'unknown')
@@ -1326,28 +1255,26 @@ def trading_loop():
                                     print(f"  [TRADE] {coin}: {msg}")
                     else:
                         error = result.get('error', 'Unknown error')
-                        print(f"[WARN] Model {model_id} failed: {error}")
+                        print(f"[WARN] 模型 {model_id} 执行失败: {error}")
                         
                 except Exception as e:
-                    print(f"[ERROR] Model {model_id} exception: {e}")
+                    print(f"[ERROR] 模型 {model_id} 异常: {e}")
                     import traceback
                     print(traceback.format_exc())
                     continue
+            print(f"[SLEEP] 等待三分钟进行下次交易")
             
-            print(f"\n{'='*60}")
-            print(f"[SLEEP] Waiting 3 minutes for next cycle")
-            print(f"{'='*60}\n")
-            
-            time.sleep(180)
+            trading_interval = int(os.getenv('TRADING_INTERVAL', '180'))
+            time.sleep(trading_interval)
             
         except Exception as e:
-            print(f"\n[CRITICAL] Trading loop error: {e}")
+            print(f"\n[CRITICAL] 交易循环异常: {e}")
             import traceback
             print(traceback.format_exc())
-            print("[RETRY] Retrying in 60 seconds\n")
-            time.sleep(60)
+            print("[RETRY] 60秒后重试\n")
+            time.sleep(60) # 等待60秒，确保模型执行完成
     
-    print("[INFO] Trading loop stopped")
+    print("[INFO] 交易循环已停止")
 
 
 
@@ -1356,43 +1283,36 @@ def init_trading_engines():
         models = db.get_all_models()
 
         if not models:
-            print("[WARN] No trading models found")
+            print("[WARN] 未找到交易模型")
             return
 
-        print(f"\n[INIT] Initializing trading engines...")
+        print(f"\n[INIT] 初始化交易引擎...")
         for model in models:
             model_id = model['id']
             model_name = model['name']
 
             try:
                 trading_engines[model_id] = _create_trading_engine(model_id)
-                print(f"  [OK] Model {model_id} ({model_name})")
+                print(f"  [OK] 模型 {model_id} ({model_name}) 初始化成功")
             except Exception as e:
-                print(f"  [ERROR] Model {model_id} ({model_name}): {e}")
+                print(f"  [ERROR] 模型 {model_id} ({model_name}): {e}")
                 continue
 
-        print(f"[INFO] Initialized {len(trading_engines)} engine(s)\n")
+        print(f"[INFO] 初始化交易引擎成功，共 {len(trading_engines)} 个引擎\n")
 
     except Exception as e:
-        print(f"[ERROR] Init engines failed: {e}\n")
+        print(f"[ERROR] 初始化交易引擎失败: {e}\n")
 
 if __name__ == '__main__':
     db.init_db()
-    
-    print("\n" + "=" * 60)
-    print("AI Trading Platform")
-    print("=" * 60)
+    print("启动交易平台")
     
     init_trading_engines()
     
     if auto_trading:
         trading_thread = threading.Thread(target=trading_loop, daemon=True)
         trading_thread.start()
-        print("[INFO] Auto-trading enabled")
     
-    print("\n" + "=" * 60)
     print(f"Server: http://localhost:{config.PORT}")
-    print("Press Ctrl+C to stop")
-    print("=" * 60 + "\n")
 
     app.run(debug=config.DEBUG, host=config.HOST, port=config.PORT, use_reloader=False)

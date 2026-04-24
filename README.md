@@ -1,16 +1,16 @@
-# AI交易模拟器
+# AI交易器
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Flask](https://img.shields.io/badge/flask-3.0+-green.svg)](https://flask.palletsprojects.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-🚀 **专业级AI驱动的加密货币交易模拟平台**
+🚀 **专业级AI驱动的加密货币交易平台**
 
-基于大语言模型模拟的智能交易决策系统，支持自定义交易策略、实时市场数据、专业级绩效分析和实时交易大屏。
+基于大语言模型的智能交易决策系统，支持自定义交易策略、实时市场数据、专业级绩效分析和实时交易大屏。
 
 **🌐 在线体验**：[https://trade.easy2ai.com](https://trade.easy2ai.com)
 
-> 本项目基于 [chadyi/AITradeGame](https://github.com/chadyi/AITradeGame) 开发，增加了用户系统、Linux DO OAuth登录、智能AI响应解析器等功能。
+> 本项目基于 [chadyi/AITradeGame](https://github.com/chadyi/AITradeGame) 开发，增加了用户系统、、智能AI响应解析器等功能。
 
 ---
 
@@ -18,7 +18,6 @@
 
 ### 🎯 用户系统
 - 🔐 **完整的用户认证** - 注册/登录，Session管理，密码加密
-- 🌐 **Linux DO OAuth** - 支持使用Linux DO账号一键登录
 - 👤 **数据隔离** - 每个用户的模型和交易数据完全独立
 - 🔒 **权限控制** - 基于装饰器的路由保护，确保数据安全
 - 🏠 **公开主页** - 未登录用户可查看实时行情和排行榜
@@ -63,7 +62,6 @@
 - **前端**：原生 JavaScript / ECharts 5.4.3
 - **数据库**：SQLite
 - **AI 接口**：OpenAI 兼容格式（支持 OpenAI、DeepSeek、Claude、Kimi 等）
-- **OAuth**：Linux DO Connect OAuth 2.0
 - **实时通信**：WebSocket (Flask-SocketIO)
 - **API 限流**：Flask-Limiter
 - **部署**：Docker / Docker Compose / Gunicorn
@@ -117,7 +115,6 @@ cd AITradeGame
 
 ```bash
 cp .env.example .env
-# 编辑 .env 文件，设置 SECRET_KEY、LINUX_DO_CLIENT_ID 等配置
 ```
 
 #### 3. 启动容器
@@ -154,7 +151,6 @@ docker-compose down
 
 - **登录页面** (`/login`) - 注册/登录
   - Tab切换注册和登录表单
-  - 支持Linux DO OAuth一键登录
   - 密码加密存储
 
 - **交易仪表板** (`/dashboard`) - 登录后的主界面
@@ -175,13 +171,6 @@ docker-compose down
    - 邮箱（可选）
 4. 点击"注册"按钮
 5. 自动跳转到交易仪表板
-
-#### 方式二：Linux DO OAuth登录（推荐）
-
-1. 点击"使用 Linux DO 登录"按钮
-2. 跳转到Linux DO授权页面
-3. 授权后自动返回并登录
-4. 首次登录自动创建账号
 
 ### 创建交易模型
 
@@ -229,10 +218,6 @@ DEBUG=False
 # 数据库配置
 DATABASE_PATH=trading_bot.db
 
-# Linux DO OAuth配置（可选）
-LINUX_DO_CLIENT_ID=你的Client ID
-LINUX_DO_CLIENT_SECRET=你的Client Secret
-LINUX_DO_REDIRECT_URI=https://trade.easy2ai.com/api/auth/callback
 
 # 交易配置
 AUTO_TRADING=True
@@ -247,7 +232,7 @@ python -c "import secrets; print(secrets.token_hex(32))"
 ## 📁 项目结构
 
 ```
-AI交易模拟器/
+AI交易器/
 ├── app.py                      # Flask应用主程序（900+行）
 ├── config.py                   # 统一配置管理
 ├── trading_engine.py           # 交易逻辑引擎
@@ -445,7 +430,7 @@ POST /api/backtest
 ## ⚠️ 注意事项
 
 ### 重要提示
-- ✅ 这是一个**模拟交易平台**（仅限纸面交易，不涉及真实资金）
+- ✅ 这是一个**交易平台**（仅限纸面交易，不涉及真实资金）
 - ✅ 需要有效的AI模型API密钥（OpenAI、DeepSeek等）
 - ✅ 需要互联网连接以获取实时市场数据
 - ⚠️ AI决策仅供参考，不构成投资建议
@@ -466,9 +451,6 @@ POST /api/backtest
    cp .env.example .env
    # 编辑 .env 文件，设置以下关键配置：
    # - SECRET_KEY（必须修改为随机字符串）
-   # - LINUX_DO_CLIENT_ID（如果使用OAuth）
-   # - LINUX_DO_CLIENT_SECRET（如果使用OAuth）
-   # - LINUX_DO_REDIRECT_URI（生产环境回调地址）
    ```
 
 3. **启动服务**
@@ -524,7 +506,6 @@ POST /api/backtest
 
 ## 📝 更新日志
 - ✅ **完整的用户认证系统** - 注册/登录/权限控制
-- ✅ **Linux DO OAuth集成** - 一键登录
 - ✅ **智能AI响应解析器** - 5层解析策略，支持多种格式
 - ✅ **自定义交易策略Prompt** - 个性化AI交易风格
 - ✅ **实时交易大屏** - Bloomberg级别的视觉效果
@@ -557,7 +538,7 @@ POST /api/backtest
 
 ## ⚖️ 免责声明
 
-**本平台仅用于教育和模拟目的，不构成任何投资建议。**
+**本平台仅用于教育和研究目的，不构成任何投资建议。**
 
 - 本平台不涉及真实资金交易
 - AI决策仅供学习和研究
@@ -581,7 +562,6 @@ POST /api/backtest
 
 在原项目基础上，我们增加了：
 - 完整的用户认证系统
-- Linux DO OAuth集成
 - 智能AI响应解析器（5层解析策略）
 - 更完善的Docker部署方案
 - 时区处理优化

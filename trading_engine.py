@@ -875,7 +875,7 @@ class TradingEngine:
                     result = self._execute_buy(coin, decision, market_state, portfolio)
                 elif signal == 'sell_to_enter':
                     result = self._execute_sell(coin, decision, market_state, portfolio)
-                elif signal == 'close_position':
+                elif signal in {'close_position', 'sell_to_close', 'buy_to_close'}:
                     result = self._execute_close(coin, decision, market_state, portfolio)
                 elif signal == 'hold':
                     result = {'coin': coin, 'signal': 'hold', 'message': 'Hold position'}
@@ -896,73 +896,34 @@ class TradingEngine:
             # 输入验证
             self._validate_quantity(quantity, coin)
             self._validate_leverage(leverage)
+            # 模拟模式：本地数据库开仓
+            required_margin = (quantity * price) / leverage
+            if required_margin > portfolio['cash']:
+                return {'coin': coin, 'error': 'Insufficient cash'}
 
-            # OKX模式：调用OKX API开多仓
-            if self.trading_mode == 'okx_demo' and okx_trader:
-                result = okx_trader.place_order(
-                    coin=coin,
-                    side='buy',  # 开多仓
-                    quantity=quantity,
-                    price=price,
-                    leverage=leverage
-                )
+            # 获取止盈止损价格
+            stop_loss = decision.get('stop_loss')
+            take_profit = decision.get('profit_target') or decision.get('take_profit')
 
-                if result.get('success'):
-                    # 获取止盈止损价格
-                    stop_loss = decision.get('stop_loss')
-                    take_profit = decision.get('profit_target') or decision.get('take_profit')
+            self.db.update_position(
+                self.model_id, coin, quantity, price, leverage, 'long',
+                stop_loss=stop_loss, take_profit=take_profit
+            )
+            self.db.add_trade(
+                self.model_id, coin, 'buy_to_enter', quantity,
+                price, leverage, 'long', pnl=0
+            )
 
-                    # 本地数据库记录止盈止损设置
-                    self.db.update_position(
-                        self.model_id, coin, quantity, price, leverage, 'long',
-                        stop_loss=stop_loss, take_profit=take_profit
-                    )
-                    self.db.add_trade(
-                        self.model_id, coin, 'buy_to_enter', quantity,
-                        price, leverage, 'long', pnl=0
-                    )
-
-                    return {
-                        'coin': coin,
-                        'signal': 'buy_to_enter',
-                        'quantity': quantity,
-                        'price': price,
-                        'leverage': leverage,
-                        'stop_loss': stop_loss,
-                        'take_profit': take_profit,
-                        'message': result.get('message', f'Long {quantity:.4f} {coin} @ ${price:.2f} (OKX)')
-                    }
-                else:
-                    return {'coin': coin, 'error': result.get('error', 'OKX order failed')}
-            else:
-                # 模拟模式：本地数据库开仓
-                required_margin = (quantity * price) / leverage 
-                if required_margin > portfolio['cash']:
-                    return {'coin': coin, 'error': 'Insufficient cash'}
-
-                # 获取止盈止损价格
-                stop_loss = decision.get('stop_loss')
-                take_profit = decision.get('profit_target') or decision.get('take_profit')
-
-                self.db.update_position(
-                    self.model_id, coin, quantity, price, leverage, 'long',
-                    stop_loss=stop_loss, take_profit=take_profit
-                )
-                self.db.add_trade(
-                    self.model_id, coin, 'buy_to_enter', quantity,
-                    price, leverage, 'long', pnl=0
-                )
-
-                return {
-                    'coin': coin,
-                    'signal': 'buy_to_enter',
-                    'quantity': quantity,
-                    'price': price,
-                    'leverage': leverage,
-                    'stop_loss': stop_loss,
-                    'take_profit': take_profit,
-                    'message': f'Long {quantity:.4f} {coin} @ ${price:.2f}'
-                }
+            return {
+                'coin': coin,
+                'signal': 'buy_to_enter',
+                'quantity': quantity,
+                'price': price,
+                'leverage': leverage,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'message': f'Long {quantity:.4f} {coin} @ ${price:.2f}'
+            }
 
         except (ValueError, TypeError) as e:
             return {'coin': coin, 'error': f'Validation failed: {str(e)}'}
@@ -977,73 +938,34 @@ class TradingEngine:
             # 输入验证
             self._validate_quantity(quantity, coin)
             self._validate_leverage(leverage)
+            # 模拟模式：本地数据库开仓
+            required_margin = (quantity * price) / leverage
+            if required_margin > portfolio['cash']:
+                return {'coin': coin, 'error': 'Insufficient cash'}
 
-            # OKX模式：调用OKX API开空仓
-            if self.trading_mode == 'okx_demo' and okx_trader:
-                result = okx_trader.place_order(
-                    coin=coin,
-                    side='sell',  # 开空仓
-                    quantity=quantity,
-                    price=price,
-                    leverage=leverage
-                )
+            # 获取止盈止损价格
+            stop_loss = decision.get('stop_loss')
+            take_profit = decision.get('profit_target') or decision.get('take_profit')
 
-                if result.get('success'):
-                    # 获取止盈止损价格
-                    stop_loss = decision.get('stop_loss')
-                    take_profit = decision.get('profit_target') or decision.get('take_profit')
+            self.db.update_position(
+                self.model_id, coin, quantity, price, leverage, 'short',
+                stop_loss=stop_loss, take_profit=take_profit
+            )
+            self.db.add_trade(
+                self.model_id, coin, 'sell_to_enter', quantity,
+                price, leverage, 'short', pnl=0
+            )
 
-                    # 本地数据库记录止盈止损设置
-                    self.db.update_position(
-                        self.model_id, coin, quantity, price, leverage, 'short',
-                        stop_loss=stop_loss, take_profit=take_profit
-                    )
-                    self.db.add_trade(
-                        self.model_id, coin, 'sell_to_enter', quantity,
-                        price, leverage, 'short', pnl=0
-                    )
-
-                    return {
-                        'coin': coin,
-                        'signal': 'sell_to_enter',
-                        'quantity': quantity,
-                        'price': price,
-                        'leverage': leverage,
-                        'stop_loss': stop_loss,
-                        'take_profit': take_profit,
-                        'message': result.get('message', f'Short {quantity:.4f} {coin} @ ${price:.2f} (OKX)')
-                    }
-                else:
-                    return {'coin': coin, 'error': result.get('error', 'OKX order failed')}
-            else:
-                # 模拟模式：本地数据库开仓
-                required_margin = (quantity * price) / leverage
-                if required_margin > portfolio['cash']:
-                    return {'coin': coin, 'error': 'Insufficient cash'}
-
-                # 获取止盈止损价格
-                stop_loss = decision.get('stop_loss')
-                take_profit = decision.get('profit_target') or decision.get('take_profit')
-
-                self.db.update_position(
-                    self.model_id, coin, quantity, price, leverage, 'short',
-                    stop_loss=stop_loss, take_profit=take_profit
-                )
-                self.db.add_trade(
-                    self.model_id, coin, 'sell_to_enter', quantity,
-                    price, leverage, 'short', pnl=0
-                )
-
-                return {
-                    'coin': coin,
-                    'signal': 'sell_to_enter',
-                    'quantity': quantity,
-                    'price': price,
-                    'leverage': leverage,
-                    'stop_loss': stop_loss,
-                    'take_profit': take_profit,
-                    'message': f'Short {quantity:.4f} {coin} @ ${price:.2f}'
-                }
+            return {
+                'coin': coin,
+                'signal': 'sell_to_enter',
+                'quantity': quantity,
+                'price': price,
+                'leverage': leverage,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'message': f'Short {quantity:.4f} {coin} @ ${price:.2f}'
+            }
 
         except (ValueError, TypeError) as e:
             return {'coin': coin, 'error': f'Validation failed: {str(e)}'}

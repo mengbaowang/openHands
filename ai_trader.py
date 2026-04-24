@@ -399,18 +399,16 @@ Provide detailed reasoning for each decision. Analyze and output JSON only.
         flat_format_keys = {'signal', 'quantity', 'leverage', 'stop_loss', 'profit_target', 'confidence', 'reasoning', 'justification'}
         
         if flat_format_keys & decisions.keys():
-            # 是扁平格式，转换为币种分组格式
-            # 导入支持的币种列表
-            import config
-            supported_coins = config.SUPPORTED_COINS
-            
-            normalized = {}
-            for coin in supported_coins:
-                normalized[coin] = decisions.copy()  # 将同一个决策应用到所有币种
-            
-            print(f'[WARN] 检测到扁平格式决策，已自动转换为币种分组格式（应用到 {len(normalized)} 个币种）')
-            
-            return normalized
+            # 是扁平格式：只允许明确指定 coin 时转换，避免“同一决策下到所有币种”的灾难性风险。
+            coin = str(decisions.get('coin', '')).upper().strip()
+            if coin:
+                normalized = {coin: decisions.copy()}
+                normalized[coin].pop('coin', None)
+                print(f'[WARN] 检测到扁平格式决策，已转换为单币种格式: {coin}')
+                return normalized
+
+            print('[ERROR] 检测到扁平格式决策但缺少 coin 字段，已拒绝该决策以避免误下单')
+            return {}
         else:
             # 已经是币种分组格式，直接返回
             return decisions

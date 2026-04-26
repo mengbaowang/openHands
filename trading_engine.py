@@ -29,6 +29,7 @@ class TradingEngine:
         self.market_fetcher = market_fetcher
         self.ai_trader = ai_trader
         self.coins = config.SUPPORTED_COINS
+        self.trading_mode = config.TRADING_MODE
         
         # 根据模式初始化交易器
         if config.TRADING_MODE == 'okx_demo':
@@ -169,14 +170,16 @@ class TradingEngine:
         for pos in positions:
             coin = pos['coin']
             if coin in current_prices:
-                position_value = pos['size'] * current_prices[coin]
+                position_quantity = pos.get('coin_quantity', 0.0)
+                position_value = pos.get('notional_usdt', position_quantity * current_prices[coin])
                 positions_value += position_value
                 
                 db_pos = self.db.get_position(self.model_id, coin, pos['side'])
                 pos_details.append({
                     'coin': coin,
                     'side': pos['side'],
-                    'quantity': pos['size'],
+                    'quantity': position_quantity,
+                    'contracts': pos.get('contracts', pos.get('size')),
                     'avg_price': pos['avg_price'],
                     'leverage': pos['leverage'],
                     'stop_loss': db_pos.get('stop_loss') if db_pos else None,
@@ -288,17 +291,19 @@ class TradingEngine:
             
             # ===== 执行平仓 =====
             if should_close:
-                okx_result = self.okx_trader.close_position(coin, side, position['quantity'])
+                close_contracts = position.get('contracts', position.get('size', 0))
+                okx_result = self.okx_trader.close_position(coin, side, close_contracts)
                 
                 if okx_result.get('success'):
+                    quantity = position.get('quantity', position.get('coin_quantity', 0))
                     if side == 'long':
-                        pnl = (current_price - entry_price) * position['quantity']
+                        pnl = (current_price - entry_price) * quantity
                     else:
-                        pnl = (entry_price - current_price) * position['quantity']
+                        pnl = (entry_price - current_price) * quantity
                     
                     self.db.close_position(self.model_id, coin, side)
                     self.db.add_trade(
-                        self.model_id, coin, triggered_by, position['quantity'],
+                        self.model_id, coin, triggered_by, quantity,
                         current_price, position['leverage'], side, pnl=pnl
                     )
                     
@@ -306,7 +311,7 @@ class TradingEngine:
                         'coin': coin,
                         'signal': triggered_by,
                         'reason': reason,
-                        'quantity': position['quantity'],
+                        'quantity': quantity,
                         'price': current_price,
                         'pnl': pnl,
                         'message': f'{coin} {reason}, P&L: ${pnl:.2f} (OKX)'
@@ -625,26 +630,43 @@ class TradingEngine:
         if not position:
             return {'coin': coin, 'error': 'Position not found in OKX'}
         
-        current_size = position['size']
+        current_contracts = position.get('contracts', position['size'])
+        current_quantity = position.get('coin_quantity', 0.0)
         ai_quantity = float(decision.get('quantity', 0))
         
         # 根据 close_all 参数决定平仓数量
         if close_all:
-            close_quantity = current_size
-            print(f"[DEBUG] {coin} 全部平仓: {close_quantity}")
+            close_contracts = current_contracts
+            close_quantity = current_quantity
+            print(f"[DEBUG] {coin} 全部平仓: {close_contracts} contracts ({close_quantity})")
         else:
             # 部分平仓
             if ai_quantity <= 0:
                 return {'coin': coin, 'error': 'Invalid quantity for partial close'}
-            if ai_quantity > current_size:
-                close_quantity = current_size  # 不能超过持仓
+            requested_contracts = self.okx_trader.coin_quantity_to_contracts(
+                coin,
+                ai_quantity,
+                market_state[coin]['price'],
+                round_up=True
+            )
+            if requested_contracts > current_contracts:
+                close_contracts = current_contracts  # 不能超过持仓
+                close_quantity = current_quantity
             else:
-                close_quantity = ai_quantity
-            print(f"[DEBUG] {coin} 部分平仓: {close_quantity} / {current_size}")
+                close_contracts = requested_contracts
+                close_quantity = min(
+                    current_quantity,
+                    self.okx_trader.contracts_to_coin_quantity(
+                        coin,
+                        close_contracts,
+                        market_state[coin]['price']
+                    )
+                )
+            print(f"[DEBUG] {coin} 部分平仓: {close_contracts} / {current_contracts} contracts")
         
         # 调用 OKX 平仓
         okx_result = self.okx_trader.close_position(
-            coin, position['side'], close_quantity
+            coin, position['side'], close_contracts
         )
         
         if okx_result.get('success'):
@@ -655,7 +677,7 @@ class TradingEngine:
                 pnl = (position['avg_price'] - current_price) * close_quantity
             
             # 更新数据库
-            if close_quantity >= current_size:
+            if close_contracts >= current_contracts:
                 # 全部平仓
                 self.db.close_position(self.model_id, coin, position['side'])
                 self.db.add_trade(
@@ -665,12 +687,10 @@ class TradingEngine:
                 message = f'(OKX) Close all {coin}, P&L: ${pnl:.2f}'
             else:
                 # 部分平仓
-                remaining = current_size - close_quantity
-                self.db.update_position(
-                    self.model_id, coin, remaining, position['avg_price'],
-                    position['leverage'], position['side'],
-                    position.get('stop_loss'), position.get('take_profit')
+                remaining_position = self.db.reduce_position(
+                    self.model_id, coin, close_quantity, position['side']
                 )
+                remaining = remaining_position['quantity'] if remaining_position else 0
                 self.db.add_trade(
                     self.model_id, coin, 'reduce_position', close_quantity,
                     current_price, position['leverage'], position['side'], pnl=pnl
@@ -742,9 +762,8 @@ class TradingEngine:
         )
         
         if okx_result.get('success'):
-            new_size = existing_position['size'] + quantity
-            self.db.update_position(
-                self.model_id, coin, new_size, current_price, leverage, 'long',
+            position_state = self.db.upsert_position_delta(
+                self.model_id, coin, quantity, current_price, leverage, 'long',
                 stop_loss, take_profit
             )
             self.db.add_trade(
@@ -755,7 +774,7 @@ class TradingEngine:
                 'coin': coin,
                 'signal': 'increase_position',
                 'okx_order_id': okx_result.get('ord_id'),
-                'message': f'(OKX) Add to long {coin} +{quantity:.4f}, total {new_size}'
+                'message': f'(OKX) Add to long {coin} +{quantity:.4f}, total {position_state["quantity"]}'
             }
         else:
             return {
@@ -815,9 +834,9 @@ class TradingEngine:
                 quantity = position['quantity']
                 entry_price = position['avg_price']
                 if side == 'long':
-                    pnl = (current_price - entry_price) * quantity
+                    pnl = (current_price - entry_price) * quantity * position['leverage']
                 else:
-                    pnl = (entry_price - current_price) * quantity
+                    pnl = (entry_price - current_price) * quantity * position['leverage']
                 
                 self.db.close_position(self.model_id, coin, side)
                 self.db.add_trade(
@@ -875,8 +894,12 @@ class TradingEngine:
                     result = self._execute_buy(coin, decision, market_state, portfolio)
                 elif signal == 'sell_to_enter':
                     result = self._execute_sell(coin, decision, market_state, portfolio)
-                elif signal == 'close_position':
+                elif signal in {'close_position', 'sell_to_close', 'buy_to_close'}:
                     result = self._execute_close(coin, decision, market_state, portfolio)
+                elif signal == 'reduce_position':
+                    result = self._execute_reduce(coin, decision, market_state, portfolio)
+                elif signal == 'increase_position':
+                    result = self._execute_increase(coin, decision, market_state, portfolio)
                 elif signal == 'hold':
                     result = {'coin': coin, 'signal': 'hold', 'message': 'Hold position'}
                 else:
@@ -944,7 +967,7 @@ class TradingEngine:
                 stop_loss = decision.get('stop_loss')
                 take_profit = decision.get('profit_target') or decision.get('take_profit')
 
-                self.db.update_position(
+                position_state = self.db.upsert_position_delta(
                     self.model_id, coin, quantity, price, leverage, 'long',
                     stop_loss=stop_loss, take_profit=take_profit
                 )
@@ -956,7 +979,7 @@ class TradingEngine:
                 return {
                     'coin': coin,
                     'signal': 'buy_to_enter',
-                    'quantity': quantity,
+                    'quantity': position_state['quantity'],
                     'price': price,
                     'leverage': leverage,
                     'stop_loss': stop_loss,
@@ -1025,7 +1048,7 @@ class TradingEngine:
                 stop_loss = decision.get('stop_loss')
                 take_profit = decision.get('profit_target') or decision.get('take_profit')
 
-                self.db.update_position(
+                position_state = self.db.upsert_position_delta(
                     self.model_id, coin, quantity, price, leverage, 'short',
                     stop_loss=stop_loss, take_profit=take_profit
                 )
@@ -1037,7 +1060,7 @@ class TradingEngine:
                 return {
                     'coin': coin,
                     'signal': 'sell_to_enter',
-                    'quantity': quantity,
+                    'quantity': position_state['quantity'],
                     'price': price,
                     'leverage': leverage,
                     'stop_loss': stop_loss,
@@ -1065,9 +1088,9 @@ class TradingEngine:
         side = position['side']
         
         if side == 'long':
-            pnl = (current_price - entry_price) * quantity
+            pnl = (current_price - entry_price) * quantity * position['leverage']
         else:
-            pnl = (entry_price - current_price) * quantity
+            pnl = (entry_price - current_price) * quantity * position['leverage']
         
         self.db.close_position(self.model_id, coin, side)
         self.db.add_trade(
@@ -1083,4 +1106,94 @@ class TradingEngine:
             'price': current_price,
             'pnl': pnl,
             'message': f'Close {coin}, P&L: ${pnl:.2f}'
+        }
+
+    def _execute_reduce(self, coin: str, decision: Dict, market_state: Dict, portfolio: Dict) -> Dict:
+        """模拟部分平仓"""
+        position = None
+        for pos in portfolio['positions']:
+            if pos['coin'] == coin:
+                position = pos
+                break
+
+        if not position:
+            return {'coin': coin, 'error': 'Position not found'}
+
+        reduce_quantity = float(decision.get('quantity', 0))
+        if reduce_quantity <= 0:
+            return {'coin': coin, 'error': 'Invalid quantity for partial close'}
+
+        current_price = market_state[coin]['price']
+        close_quantity = min(position['quantity'], reduce_quantity)
+        entry_price = position['avg_price']
+        side = position['side']
+
+        if side == 'long':
+            pnl = (current_price - entry_price) * close_quantity * position['leverage']
+        else:
+            pnl = (entry_price - current_price) * close_quantity * position['leverage']
+
+        remaining_position = self.db.reduce_position(self.model_id, coin, close_quantity, side)
+        remaining = remaining_position['quantity'] if remaining_position else 0
+        self.db.add_trade(
+            self.model_id, coin, 'reduce_position',
+            close_quantity, current_price,
+            position['leverage'], side, pnl=pnl
+        )
+
+        return {
+            'coin': coin,
+            'signal': 'reduce_position',
+            'quantity': close_quantity,
+            'remaining_quantity': remaining,
+            'price': current_price,
+            'pnl': pnl,
+            'message': f'Reduce {coin} by {close_quantity:.4f}, remaining {remaining:.4f}, P&L: ${pnl:.2f}'
+        }
+
+    def _execute_increase(self, coin: str, decision: Dict, market_state: Dict, portfolio: Dict) -> Dict:
+        """模拟部分加仓（当前仅支持已有多仓加仓）"""
+        position = None
+        for pos in portfolio['positions']:
+            if pos['coin'] == coin:
+                position = pos
+                break
+
+        if not position:
+            return {'coin': coin, 'error': 'No existing position to add to'}
+        if position['side'] != 'long':
+            return {'coin': coin, 'error': 'Increase position is only supported for existing long positions'}
+
+        quantity = float(decision.get('quantity', 0))
+        leverage = int(decision.get('leverage', position['leverage']))
+        price = market_state[coin]['price']
+
+        self._validate_quantity(quantity, coin)
+        self._validate_leverage(leverage)
+
+        required_margin = (quantity * price) / leverage
+        if required_margin > portfolio['cash']:
+            return {'coin': coin, 'error': 'Insufficient cash'}
+
+        stop_loss = decision.get('stop_loss')
+        take_profit = decision.get('profit_target') or decision.get('take_profit')
+        position_state = self.db.upsert_position_delta(
+            self.model_id, coin, quantity, price, leverage, 'long',
+            stop_loss=stop_loss, take_profit=take_profit
+        )
+        self.db.add_trade(
+            self.model_id, coin, 'increase_position', quantity,
+            price, leverage, 'long', pnl=0
+        )
+
+        return {
+            'coin': coin,
+            'signal': 'increase_position',
+            'quantity': quantity,
+            'total_quantity': position_state['quantity'],
+            'price': price,
+            'leverage': leverage,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'message': f'Add to long {coin} +{quantity:.4f}, total {position_state["quantity"]:.4f}'
         }

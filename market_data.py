@@ -512,6 +512,10 @@ class MarketDataFetcher:
     def calculate_technical_indicators(self, coin: str) -> Dict:
         """Calculate technical indicators"""
         historical = self.get_historical_prices(coin, days=30)
+        return self.calculate_technical_indicators_from_history(historical)
+
+    def calculate_technical_indicators_from_history(self, historical: List[Dict]) -> Dict:
+        """Calculate technical indicators from a provided historical window."""
 
         if not historical or len(historical) < 14:
             return {}

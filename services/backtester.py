@@ -33,8 +33,11 @@ class Backtester:
         portfolio = {
             'cash': initial_capital,
             'positions': [],
-            'total_value': initial_capital
+            'total_value': initial_capital,
+            'positions_value': 0
         }
+        model_config = dict(model_config)
+        model_config['initial_capital'] = initial_capital
         
         trades = []
         daily_values = []
@@ -60,16 +63,13 @@ class Backtester:
             self._update_portfolio_value(portfolio, market_data)
             
             # AI做决策
-            decision = self._make_trading_decision(
+            decisions = self._make_trading_decision(
                 model_config, portfolio, market_data
             )
             
             # 执行交易
-            if decision and decision.get('signal') != 'hold':
-                trade_result = self._execute_backtest_trade(
-                    portfolio, decision, market_data
-                )
-                if trade_result:
+            if decisions:
+                for trade_result in self._execute_backtest_trades(portfolio, decisions, market_data):
                     trades.append({
                         'date': date_str,
                         **trade_result
@@ -104,16 +104,27 @@ class Backtester:
     def _get_historical_market_data(self, date: str) -> Dict:
         """获取历史市场数据"""
         prices = {}
+        target_ts = int(datetime.strptime(date, '%Y-%m-%d').timestamp() * 1000)
         
         for coin in config.SUPPORTED_COINS:
             # 获取历史价格
             historical = self.market_fetcher.get_historical_prices(coin, days=30)
             
             if historical:
-                # 简化：使用最新价格作为当天价格
+                selected = None
+                for item in historical:
+                    if item.get('timestamp', 0) <= target_ts:
+                        selected = item
+                    else:
+                        break
+
+                if selected is None:
+                    selected = historical[0]
+
                 prices[coin] = {
-                    'price': historical[-1]['price'],
-                    'volume': historical[-1].get('volume', 0)
+                    'price': selected['price'],
+                    'volume': selected.get('volume', 0),
+                    'timestamp': selected.get('timestamp')
                 }
         
         return prices if prices else None
@@ -121,99 +132,182 @@ class Backtester:
     def _update_portfolio_value(self, portfolio: Dict, market_data: Dict):
         """更新投资组合价值"""
         total_value = portfolio['cash']
+        positions_value = 0
         
         for position in portfolio['positions']:
             coin = position['coin']
             if coin in market_data:
                 position_value = position['quantity'] * market_data[coin]['price']
+                positions_value += position_value
                 total_value += position_value
         
         portfolio['total_value'] = total_value
+        portfolio['positions_value'] = positions_value
     
     def _make_trading_decision(self, model_config: Dict, portfolio: Dict, 
                                market_data: Dict) -> Dict:
         """AI做交易决策"""
         try:
-            # 构建市场状态
-            market_state = {
-                'prices': {coin: data['price'] for coin, data in market_data.items()},
-                'portfolio': portfolio
+            market_state = {}
+            for coin, data in market_data.items():
+                historical = self.market_fetcher.get_historical_prices(coin, days=30)
+                bounded_history = [
+                    item for item in historical
+                    if item.get('timestamp', 0) <= data.get('timestamp', 0)
+                ]
+                market_state[coin] = {
+                    'price': data['price'],
+                    'change_24h': 0,
+                    'indicators': self.market_fetcher.calculate_technical_indicators_from_history(bounded_history)
+                }
+
+            account_info = {
+                'initial_capital': model_config.get('initial_capital', portfolio['total_value']),
+                'total_return': (
+                    ((portfolio['total_value'] - model_config.get('initial_capital', portfolio['total_value']))
+                    / model_config.get('initial_capital', portfolio['total_value'])) * 100
+                ) if model_config.get('initial_capital', portfolio['total_value']) else 0
             }
-            
-            # 获取技术指标（简化版）
-            indicators = {}
-            for coin in config.SUPPORTED_COINS:
-                indicators[coin] = self.market_fetcher.calculate_technical_indicators(coin)
-            
-            # AI决策
-            decision = self.ai_trader.make_decision(
-                market_state, indicators, portfolio
+
+            decisions, _ = self.ai_trader.make_decision(
+                market_state, portfolio, account_info
             )
-            
-            return decision
+            return decisions
         except Exception as e:
             print(f"❌ AI决策失败: {e}")
             return None
     
-    def _execute_backtest_trade(self, portfolio: Dict, decision: Dict, 
-                                market_data: Dict) -> Dict:
+    def _execute_backtest_trades(self, portfolio: Dict, decisions: Dict,
+                                 market_data: Dict) -> List[Dict]:
         """执行回测交易"""
-        signal = decision.get('signal')
-        coin = decision.get('coin')
-        quantity = decision.get('quantity', 0)
-        leverage = decision.get('leverage', 1)
-        
-        if not coin or coin not in market_data:
-            return None
-        
-        price = market_data[coin]['price']
-        
-        if signal == 'buy':
-            # 买入
-            required_cash = (quantity * price) / leverage
-            
-            if required_cash > portfolio['cash']:
-                return None
-            
-            portfolio['cash'] -= required_cash
-            portfolio['positions'].append({
-                'coin': coin,
-                'quantity': quantity,
-                'avg_price': price,
-                'leverage': leverage,
-                'side': 'long'
-            })
-            
-            return {
-                'signal': 'buy',
-                'coin': coin,
-                'quantity': quantity,
-                'price': price,
-                'leverage': leverage
-            }
-        
-        elif signal == 'sell':
-            # 卖出（平仓）
+        results = []
+
+        for coin, decision in decisions.items():
+            signal = decision.get('signal')
+            quantity = float(decision.get('quantity', 0) or 0)
+            leverage = int(decision.get('leverage', 1) or 1)
+
+            if coin not in market_data or signal == 'hold':
+                continue
+
+            price = market_data[coin]['price']
             position = next((p for p in portfolio['positions'] if p['coin'] == coin), None)
-            
-            if not position:
-                return None
-            
-            # 计算盈亏
-            pnl = (price - position['avg_price']) * position['quantity'] * position['leverage']
-            
-            portfolio['cash'] += (position['quantity'] * position['avg_price']) / position['leverage'] + pnl
-            portfolio['positions'].remove(position)
-            
-            return {
-                'signal': 'sell',
-                'coin': coin,
-                'quantity': position['quantity'],
-                'price': price,
-                'pnl': pnl
-            }
-        
-        return None
+
+            if signal == 'buy_to_enter':
+                required_cash = (quantity * price) / leverage
+                if required_cash > portfolio['cash'] or quantity <= 0:
+                    continue
+
+                portfolio['cash'] -= required_cash
+                if position and position['side'] == 'long':
+                    new_quantity = position['quantity'] + quantity
+                    position['avg_price'] = ((position['quantity'] * position['avg_price']) + (quantity * price)) / new_quantity
+                    position['quantity'] = new_quantity
+                    position['leverage'] = leverage
+                else:
+                    portfolio['positions'].append({
+                        'coin': coin,
+                        'quantity': quantity,
+                        'avg_price': price,
+                        'leverage': leverage,
+                        'side': 'long'
+                    })
+
+                results.append({
+                    'signal': signal,
+                    'coin': coin,
+                    'quantity': quantity,
+                    'price': price,
+                    'leverage': leverage
+                })
+
+            elif signal == 'sell_to_enter':
+                required_cash = (quantity * price) / leverage
+                if required_cash > portfolio['cash'] or quantity <= 0:
+                    continue
+
+                portfolio['cash'] -= required_cash
+                if position and position['side'] == 'short':
+                    new_quantity = position['quantity'] + quantity
+                    position['avg_price'] = ((position['quantity'] * position['avg_price']) + (quantity * price)) / new_quantity
+                    position['quantity'] = new_quantity
+                    position['leverage'] = leverage
+                else:
+                    portfolio['positions'].append({
+                        'coin': coin,
+                        'quantity': quantity,
+                        'avg_price': price,
+                        'leverage': leverage,
+                        'side': 'short'
+                    })
+
+                results.append({
+                    'signal': signal,
+                    'coin': coin,
+                    'quantity': quantity,
+                    'price': price,
+                    'leverage': leverage
+                })
+
+            elif signal in {'close_position', 'sell_to_close', 'buy_to_close'} and position:
+                if position['side'] == 'long':
+                    pnl = (price - position['avg_price']) * position['quantity'] * position['leverage']
+                else:
+                    pnl = (position['avg_price'] - price) * position['quantity'] * position['leverage']
+
+                portfolio['cash'] += (position['quantity'] * position['avg_price']) / position['leverage'] + pnl
+                portfolio['positions'].remove(position)
+                results.append({
+                    'signal': signal,
+                    'coin': coin,
+                    'quantity': position['quantity'],
+                    'price': price,
+                    'pnl': pnl
+                })
+
+            elif signal == 'reduce_position' and position:
+                close_quantity = min(position['quantity'], quantity)
+                if close_quantity <= 0:
+                    continue
+
+                if position['side'] == 'long':
+                    pnl = (price - position['avg_price']) * close_quantity * position['leverage']
+                else:
+                    pnl = (position['avg_price'] - price) * close_quantity * position['leverage']
+
+                portfolio['cash'] += (close_quantity * position['avg_price']) / position['leverage'] + pnl
+                position['quantity'] -= close_quantity
+                if position['quantity'] <= 0:
+                    portfolio['positions'].remove(position)
+
+                results.append({
+                    'signal': signal,
+                    'coin': coin,
+                    'quantity': close_quantity,
+                    'price': price,
+                    'pnl': pnl
+                })
+
+            elif signal == 'increase_position' and position and position['side'] == 'long':
+                required_cash = (quantity * price) / leverage
+                if required_cash > portfolio['cash'] or quantity <= 0:
+                    continue
+
+                portfolio['cash'] -= required_cash
+                new_quantity = position['quantity'] + quantity
+                position['avg_price'] = ((position['quantity'] * position['avg_price']) + (quantity * price)) / new_quantity
+                position['quantity'] = new_quantity
+                position['leverage'] = leverage
+
+                results.append({
+                    'signal': signal,
+                    'coin': coin,
+                    'quantity': quantity,
+                    'price': price,
+                    'leverage': leverage
+                })
+
+        return results
     
     def _calculate_backtest_metrics(self, trades: List[Dict], 
                                     daily_values: List[Dict], 

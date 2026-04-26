@@ -4,6 +4,7 @@ OKX 模拟盘交易模块
 from okx import Account, Trade, MarketData
 import config
 import time
+import requests
 
 class OKXTrader:
     """OKX 模拟盘交易器"""
@@ -25,6 +26,7 @@ class OKXTrader:
             config.OKX_FLAG
         )
         self.market_api = MarketData.MarketAPI(flag=config.OKX_FLAG)
+        self._instrument_cache = {}
         
         # 设置超时（如果 SDK 支持）
         try:
@@ -34,6 +36,75 @@ class OKXTrader:
                 pass
         except Exception as e:
             print(f"[INFO] 设置超时失败: {e}")
+
+    def get_contract_face_value(self, coin: str) -> float:
+        """Return the swap contract value in base coin units."""
+        inst_id = config.OKX_SYMBOLS.get(coin)
+        if not inst_id:
+            return 0.0
+        instrument = self.get_instrument_spec(inst_id)
+        return float(instrument.get('ctVal', 0))
+
+    def get_instrument_spec(self, inst_id: str) -> dict:
+        """Fetch and cache OKX instrument metadata."""
+        if inst_id in self._instrument_cache:
+            return self._instrument_cache[inst_id]
+
+        response = requests.get(
+            f'{config.OKX_API_URL}/public/instruments',
+            params={'instType': 'SWAP', 'instId': inst_id},
+            timeout=10
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get('code') != '0' or not result.get('data'):
+            raise ValueError(f'Failed to load instrument spec for {inst_id}: {result.get("msg", "unknown error")}')
+
+        instrument = result['data'][0]
+        self._instrument_cache[inst_id] = instrument
+        return instrument
+
+    def normalize_contracts(self, coin: str, contracts: float, round_up: bool = False) -> float:
+        """Normalize contract size to OKX lot size rules."""
+        inst_id = config.OKX_SYMBOLS.get(coin)
+        if not inst_id:
+            raise ValueError(f'Unsupported coin: {coin}')
+
+        instrument = self.get_instrument_spec(inst_id)
+        lot_size = float(instrument.get('lotSz', 1) or 1)
+        min_size = float(instrument.get('minSz', lot_size) or lot_size)
+        contracts = float(contracts)
+
+        if lot_size <= 0:
+            raise ValueError(f'Invalid lot size for {coin}: {lot_size}')
+
+        import math
+        steps = contracts / lot_size
+        normalized_steps = math.ceil(steps) if round_up else math.floor(steps)
+        normalized = normalized_steps * lot_size
+
+        if contracts > 0 and normalized < min_size:
+            normalized = min_size
+
+        precision = max(0, len(str(lot_size).split('.')[-1].rstrip('0'))) if '.' in str(lot_size) else 0
+        return round(normalized, precision)
+
+    def coin_quantity_to_contracts(self, coin: str, quantity: float, price: float, round_up: bool = False) -> int:
+        """Convert base coin quantity to OKX contract count."""
+        face_value = self.get_contract_face_value(coin)
+        if face_value <= 0:
+            raise ValueError(f'Invalid contract value for {coin}: {face_value}')
+
+        raw_contracts = float(quantity) / face_value
+        return self.normalize_contracts(coin, raw_contracts, round_up=round_up)
+
+    def contracts_to_coin_quantity(self, coin: str, contracts: float, price: float) -> float:
+        """Convert OKX contract count to base coin quantity."""
+        return float(contracts) * self.get_contract_face_value(coin)
+
+    def contracts_to_notional_usdt(self, coin: str, contracts: float, price: float) -> float:
+        """Convert OKX contract count to notional USDT."""
+        return self.contracts_to_coin_quantity(coin, contracts, price) * float(price)
 
     def get_balance(self) -> dict:
         """
@@ -128,12 +199,22 @@ class OKXTrader:
                     if data:
                         for pos in data:
                             if float(pos.get('pos', 0)) != 0:
+                                coin = pos.get('instId').split('-')[0]
+                                contracts = float(pos.get('pos', 0))
+                                avg_price = float(pos.get('avgPx', 0))
+                                instrument = self.get_instrument_spec(pos.get('instId'))
                                 all_positions.append({
-                                    'coin': pos.get('instId').split('-')[0],
+                                    'coin': coin,
                                     'inst_id': pos.get('instId'),
                                     'side': pos.get('posSide'),
-                                    'size': float(pos.get('pos', 0)),
-                                    'avg_price': float(pos.get('avgPx', 0)),
+                                    'size': contracts,
+                                    'contracts': contracts,
+                                    'avg_price': avg_price,
+                                    'coin_quantity': self.contracts_to_coin_quantity(coin, contracts, avg_price),
+                                    'face_value': self.get_contract_face_value(coin),
+                                    'lot_size': float(instrument.get('lotSz', 1) or 1),
+                                    'min_size': float(instrument.get('minSz', 1) or 1),
+                                    'notional_usdt': self.contracts_to_notional_usdt(coin, contracts, avg_price),
                                     'leverage': int(pos.get('lever', 1)),
                                     'unrealized_pnl': float(pos.get('upl', 0)),
                                     'mgnMode': pos.get('mgnMode', ''),
@@ -175,20 +256,12 @@ class OKXTrader:
 
             print(f"[DEBUG] OKX下单参数: coin={coin}, inst_id={inst_id}, side={side}, quantity={quantity}, price={price}, leverage={leverage}")
 
-            # OKX 永续合约每张面值（单位：USDT）
-            contract_face_values = {
-                'BTC': 100,
-                'ETH': 10,
-                'SOL': 10,
-                'BNB': 1,
-                'XRP': 1000,
-                'DOGE': 10
-            }
-            face_value = contract_face_values.get(coin, 1)  # 默认 1 USDT/张
+            # OKX 永续合约每张合约价值（单位：标的币）
+            face_value = self.get_contract_face_value(coin)
 
-            # 计算合约张数：张数 = (币数量 × 当前价格) / 每张面值
+            # 计算合约张数：张数 = 币数量 / 每张合约价值
             contract_value = quantity * price  # 订单总价值（USDT）
-            contract_size = int(contract_value / face_value)  # 向下取整得到张数
+            contract_size = self.coin_quantity_to_contracts(coin, quantity, price)  # 按交易所规格对齐得到张数
 
             print(f"[DEBUG] 币数量: {quantity}, 当前价格: {price}, 订单价值: {contract_value} USDT")
             print(f"[DEBUG] 每张面值: {face_value} USDT, 计算得张数: {contract_size} 张")

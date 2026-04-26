@@ -218,6 +218,127 @@ class Database:
         ''', (model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit))
         conn.commit()
         conn.close()
+
+    def upsert_position_delta(self, model_id: int, coin: str, quantity_delta: float,
+                              price: float, leverage: int = 1, side: str = 'long',
+                              stop_loss: float = None, take_profit: float = None) -> Dict:
+        """Apply a quantity delta and keep a weighted average entry price."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT quantity, avg_price, leverage, stop_loss, take_profit
+            FROM portfolios
+            WHERE model_id = ? AND coin = ? AND side = ?
+        ''', (model_id, coin, side))
+        existing = cursor.fetchone()
+
+        if existing:
+            current_quantity = float(existing['quantity'])
+            current_avg_price = float(existing['avg_price'])
+            new_quantity = current_quantity + float(quantity_delta)
+
+            if new_quantity <= 0:
+                cursor.execute('''
+                    DELETE FROM portfolios
+                    WHERE model_id = ? AND coin = ? AND side = ?
+                ''', (model_id, coin, side))
+                conn.commit()
+                conn.close()
+                return {
+                    'quantity': 0.0,
+                    'avg_price': 0.0,
+                    'leverage': leverage,
+                    'stop_loss': stop_loss,
+                    'take_profit': take_profit
+                }
+
+            weighted_avg_price = (
+                (current_quantity * current_avg_price) + (float(quantity_delta) * float(price))
+            ) / new_quantity
+            cursor.execute('''
+                UPDATE portfolios
+                SET quantity = ?, avg_price = ?, leverage = ?, stop_loss = ?, take_profit = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE model_id = ? AND coin = ? AND side = ?
+            ''', (
+                new_quantity,
+                weighted_avg_price,
+                leverage,
+                stop_loss if stop_loss is not None else existing['stop_loss'],
+                take_profit if take_profit is not None else existing['take_profit'],
+                model_id,
+                coin,
+                side
+            ))
+            conn.commit()
+            conn.close()
+            return {
+                'quantity': new_quantity,
+                'avg_price': weighted_avg_price,
+                'leverage': leverage,
+                'stop_loss': stop_loss if stop_loss is not None else existing['stop_loss'],
+                'take_profit': take_profit if take_profit is not None else existing['take_profit']
+            }
+
+        cursor.execute('''
+            INSERT INTO portfolios (model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (model_id, coin, float(quantity_delta), float(price), leverage, side, stop_loss, take_profit))
+        conn.commit()
+        conn.close()
+        return {
+            'quantity': float(quantity_delta),
+            'avg_price': float(price),
+            'leverage': leverage,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit
+        }
+
+    def reduce_position(self, model_id: int, coin: str, quantity_delta: float, side: str = 'long') -> Optional[Dict]:
+        """Reduce a position quantity while preserving its average entry price."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT quantity, avg_price, leverage, stop_loss, take_profit
+            FROM portfolios
+            WHERE model_id = ? AND coin = ? AND side = ?
+        ''', (model_id, coin, side))
+        existing = cursor.fetchone()
+
+        if not existing:
+            conn.close()
+            return None
+
+        current_quantity = float(existing['quantity'])
+        remaining_quantity = current_quantity - float(quantity_delta)
+        if remaining_quantity <= 0:
+            cursor.execute('''
+                DELETE FROM portfolios
+                WHERE model_id = ? AND coin = ? AND side = ?
+            ''', (model_id, coin, side))
+            conn.commit()
+            conn.close()
+            return {
+                'quantity': 0.0,
+                'avg_price': float(existing['avg_price']),
+                'leverage': int(existing['leverage']),
+                'stop_loss': existing['stop_loss'],
+                'take_profit': existing['take_profit']
+            }
+
+        cursor.execute('''
+            UPDATE portfolios
+            SET quantity = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE model_id = ? AND coin = ? AND side = ?
+        ''', (remaining_quantity, model_id, coin, side))
+        conn.commit()
+        conn.close()
+        return {
+            'quantity': remaining_quantity,
+            'avg_price': float(existing['avg_price']),
+            'leverage': int(existing['leverage']),
+            'stop_loss': existing['stop_loss'],
+            'take_profit': existing['take_profit']
+        }
     
     
     def close_position(self, model_id: int, coin: str, side: str = 'long'):
@@ -416,9 +537,9 @@ class Database:
                     
                     # Calculate position P&L
                     if pos['side'] == 'long':
-                        pos_pnl = (current_price - entry_price) * quantity
+                        pos_pnl = (current_price - entry_price) * quantity * pos['leverage']
                     else:  # short
-                        pos_pnl = (entry_price - current_price) * quantity
+                        pos_pnl = (entry_price - current_price) * quantity * pos['leverage']
                     pos['pnl'] = pos_pnl
                     unrealized_pnl += pos_pnl
                 else:
@@ -518,14 +639,16 @@ class Database:
             for pos in positions_data:
                 coin = pos['coin']
                 if coin in current_prices:
-                    position_value = pos['size'] * current_prices[coin]
+                    position_quantity = pos.get('coin_quantity', 0.0)
+                    position_value = pos.get('notional_usdt', position_quantity * current_prices[coin])
                     positions_value += position_value
                     
                     db_pos = self.get_position(model_id, coin, pos['side'])
                     pos_details.append({
                         'coin': coin,
                         'side': pos['side'],
-                        'quantity': pos['size'],
+                        'quantity': position_quantity,
+                        'contracts': pos.get('contracts', pos.get('size')),
                         'avg_price': pos['avg_price'],
                         'leverage': pos['leverage'],
                         'stop_loss': db_pos.get('stop_loss') if db_pos else None,

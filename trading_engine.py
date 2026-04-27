@@ -1,4 +1,5 @@
 from datetime import datetime
+import time
 from typing import Dict
 import json
 import config
@@ -30,6 +31,7 @@ class TradingEngine:
         self.ai_trader = ai_trader
         self.coins = config.SUPPORTED_COINS
         self.trading_mode = config.TRADING_MODE
+        self._cycle_logs = []
         
         # 根据模式初始化交易器
         if config.TRADING_MODE == 'okx_demo':
@@ -37,6 +39,20 @@ class TradingEngine:
             print(f"[INFO] 模型 {model_id} 已初始化，模式：{config.TRADING_MODE}")
         else:
             self.okx_trader = None
+
+    def _debug_log(self, message: str) -> None:
+        """Collect verbose debug details and print them once per trading cycle."""
+        self._cycle_logs.append(message)
+
+    def _flush_cycle_logs(self) -> None:
+        """Print a concise cycle summary instead of streaming every debug line."""
+        if not self._cycle_logs:
+            return
+
+        print(f"[DEBUG] 模型 {self.model_id} 本轮摘要（{len(self._cycle_logs)} 条）")
+        for item in self._cycle_logs:
+            print(f"  {item}")
+        self._cycle_logs = []
 
     def _validate_quantity(self, quantity: float, coin: str) -> None:
         """验证交易数量"""
@@ -56,6 +72,7 @@ class TradingEngine:
 
     def execute_trading_cycle(self) -> Dict:
         try:
+            self._cycle_logs = []
             market_state = self._get_market_state()
             current_prices = {coin: market_state[coin]['price'] for coin in market_state}
             
@@ -82,7 +99,7 @@ class TradingEngine:
             # print(f'[DEBUG] 决策数量: {len(decisions) if decisions else 0}')
             if decisions:
                 for coin, decision in decisions.items():
-                    print(f'[DEBUG] 模型 {self.model_id} 决策: {coin}: {decision}')
+                    self._debug_log(f'决策 {coin}: {decision}')
             #print(f'[DEBUG] 模型 {self.model_id} 原始响应长度: {len(raw_response) if raw_response else 0}')
 
             # 只有在AI返回有效决策时才存储对话记录
@@ -126,10 +143,13 @@ class TradingEngine:
                 'portfolio': updated_portfolio
             }
         except Exception as e:
+            self._flush_cycle_logs()
             print(f"[ERROR] Trading cycle failed (Model {self.model_id}): {e}")
             import traceback
             print(traceback.format_exc())
             return {'success': False, 'error': str(e)}
+        finally:
+            self._flush_cycle_logs()
 
     def _get_okx_portfolio(self, current_prices: Dict) -> Dict:
         """从 OKX 获取真实持仓"""
@@ -166,13 +186,24 @@ class TradingEngine:
         
         positions_value = 0
         pos_details = []
+        unrealized_pnl = 0
+        realized_pnl = 0
+        if self.db:
+            trades = self.db.get_trades(self.model_id, limit=100000)
+            realized_pnl = sum(trade.get('pnl', 0) for trade in trades)
         
         for pos in positions:
             coin = pos['coin']
             if coin in current_prices:
+                current_price = current_prices[coin]
                 position_quantity = pos.get('coin_quantity', 0.0)
                 position_value = pos.get('notional_usdt', position_quantity * current_prices[coin])
                 positions_value += position_value
+                if pos['side'] == 'long':
+                    pos_pnl = (current_price - pos['avg_price']) * position_quantity
+                else:
+                    pos_pnl = (pos['avg_price'] - current_price) * position_quantity
+                unrealized_pnl += pos_pnl
                 
                 db_pos = self.db.get_position(self.model_id, coin, pos['side'])
                 pos_details.append({
@@ -181,21 +212,25 @@ class TradingEngine:
                     'quantity': position_quantity,
                     'contracts': pos.get('contracts', pos.get('size')),
                     'avg_price': pos['avg_price'],
+                    'current_price': current_price,
                     'leverage': pos['leverage'],
+                    'pnl': pos_pnl,
                     'stop_loss': db_pos.get('stop_loss') if db_pos else None,
                     'take_profit': db_pos.get('take_profit') if db_pos else None,
                     'value': position_value
                 })
         
-        print(f"[DEBUG] 账户总值: {total_value:.2f} USDT")
-        print(f"[DEBUG] 现金价值: {cash:.2f} USDT")
-        print(f"[DEBUG] 已用保证金: {frozen_margin:.2f} USDT")
+        self._debug_log(f"账户总值: {total_value:.2f} USDT")
+        self._debug_log(f"现金价值: {cash:.2f} USDT")
+        self._debug_log(f"已用保证金: {frozen_margin:.2f} USDT")
         
         return {
             'cash': cash,                           # 现金 = USDT 可用
             'positions': pos_details,                # 合约持仓
             'total_value': total_value,              # 账户总值 = 所有资产
             'positions_value': positions_value,      # 合约持仓价值
+            'realized_pnl': realized_pnl,
+            'unrealized_pnl': unrealized_pnl,
             'frozen_margin': frozen_margin,          # 已用保证金
             'wallet_balances': balance.get('balances', {})
         }
@@ -249,7 +284,7 @@ class TradingEngine:
             
             # 打印移动止损信息（只在跨过新台阶时）
             if trailing_stop_loss and current_tier:
-                print(f"[DEBUG] {coin} 当前盈利 {profit_pct*100:.1f}%, 止损阶梯 {current_tier*100:.0f}%: ${trailing_stop_loss:.2f}")
+                self._debug_log(f"{coin} 当前盈利 {profit_pct*100:.1f}%, 止损阶梯 {current_tier*100:.0f}%: ${trailing_stop_loss:.2f}")
             
             # ===== 检查是否触发止盈止损 =====
             should_close = False
@@ -321,8 +356,7 @@ class TradingEngine:
 
     def _execute_decisions_okx(self, decisions: Dict, market_state: Dict, portfolio: Dict) -> list:
         """执行 OKX 决策"""
-        print(f"[DEBUG] 模型 {self.model_id} ===== _execute_decisions_okx 开始 =====")
-        print(f"[DEBUG] 模型 {self.model_id} 决策数量: {len(decisions)}")
+        self._debug_log(f"开始执行 OKX 决策，数量: {len(decisions)}")
         
         results = []
         supported_coins = config.SUPPORTED_COINS
@@ -332,29 +366,27 @@ class TradingEngine:
             
             # 检查是否在支持列表中
             if coin not in supported_coins:
-                print(f"[DEBUG] 模型 {self.model_id} {coin} 不在支持列表中，跳过")
+                self._debug_log(f"{coin} 不在支持列表中，跳过")
                 continue
             
             # 验证决策格式
             if not isinstance(decision, dict) or 'signal' not in decision:
-                print(f"[DEBUG] 模型 {self.model_id} {coin} 决策格式错误: {decision}，跳过")
+                self._debug_log(f"{coin} 决策格式错误，跳过: {decision}")
                 continue
             
             signal = decision.get('signal')
-            print(f"[DEBUG] 模型 {self.model_id} {coin} 信号: {signal}")
+            self._debug_log(f"{coin} 信号: {signal}")
             
             try:
                 if signal == 'buy_to_enter':
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} 准备调用 _execute_buy_okx...")
                     result = self._execute_buy_okx(coin, decision, market_state, portfolio)
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} _execute_buy_okx 返回: {result}")
+                    self._debug_log(f"{coin} 做多执行结果: {result}")
                     results.append(result)
                     
                 # 卖出信号处理
                 elif signal == 'sell_to_enter':
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} 准备调用 _execute_sell_okx...")
                     result = self._execute_sell_okx(coin, decision, market_state, portfolio)
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} _execute_sell_okx 返回: {result}")
+                    self._debug_log(f"{coin} 做空执行结果: {result}")
                     results.append(result)
                 elif signal == 'hold':
                     # print(f"[DEBUG] 模型 {self.model_id} {coin} 持仓")
@@ -366,34 +398,30 @@ class TradingEngine:
                     
                 elif signal == 'sell_to_close':
                     # 全部平仓（平多）
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} 准备全部平仓...")
                     result = self._execute_close_okx(coin, decision, market_state, portfolio, close_all=True)
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} _execute_close_okx 返回: {result}")
+                    self._debug_log(f"{coin} 全平执行结果: {result}")
                     results.append(result)
 
                 elif signal == 'reduce_position':
                     # 部分平仓
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} 准备部分平仓...")
                     result = self._execute_close_okx(coin, decision, market_state, portfolio, close_all=False)
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} _execute_close_okx 返回: {result}")
+                    self._debug_log(f"{coin} 减仓执行结果: {result}")
                     results.append(result)
 
                 elif signal == 'increase_position':
                     # 部分加仓
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} 准备部分加仓...")
                     result = self._execute_add_okx(coin, decision, market_state, portfolio)
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} _execute_add_okx 返回: {result}")
+                    self._debug_log(f"{coin} 加仓执行结果: {result}")
                     results.append(result)
 
                 elif signal == 'buy_to_close':
                     # 全部平仓（平空）
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} 准备全部平仓（空）...")
                     result = self._execute_close_okx(coin, decision, market_state, portfolio, close_all=True)
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} _execute_close_okx 返回: {result}")
+                    self._debug_log(f"{coin} 平空执行结果: {result}")
                     results.append(result)
                     
                 else:
-                    print(f"[DEBUG] 模型 {self.model_id} {coin} 信号 '{signal}' 不支持，跳过")
+                    self._debug_log(f"{coin} 信号 '{signal}' 不支持，跳过")
                     results.append({
                         'coin': coin,
                         'signal': signal,
@@ -414,14 +442,14 @@ class TradingEngine:
                 #         'error': f'Unsupported signal: {signal}'
                 #     })
             except Exception as e:
-                print(f"[DEBUG] 模型 {self.model_id} {coin} 执行失败: {e}")
+                self._debug_log(f"{coin} 执行失败: {e}")
                 results.append({
                     'coin': coin,
                     'signal': signal,
                     'error': f'Execution failed: {str(e)}'
                 })
         
-        print(f"[DEBUG] 模型 {self.model_id} ===== _execute_decisions_okx 结束，共处理 {len(results)} 个币种 =====")
+        self._debug_log(f"OKX 决策执行结束，共处理 {len(results)} 个币种")
         return results
 
     def _execute_buy_okx(self, coin: str, decision: Dict, market_state: Dict, portfolio: Dict) -> Dict:
@@ -439,15 +467,14 @@ class TradingEngine:
         self._validate_leverage(leverage)
         
         # 只检查 OKX 合约持仓，不检查钱包余额
-        print(f"[DEBUG] 模型 {self.model_id} {coin} 检查 OKX 合约持仓...")
         okx_positions = self.okx_trader.get_positions()
-        print(f"[DEBUG] 模型 {self.model_id} {coin} OKX 合约持仓: {okx_positions}")
+        self._debug_log(f"{coin} OKX 合约持仓检查完成")
         
         for pos in okx_positions:
             if pos['coin'] == coin:
                 return {'coin': coin, 'error': f'OKX 已有 {coin} 合约持仓'}
         
-        print(f"[DEBUG] 模型 {self.model_id} {coin} 无持仓，准备下单")
+        self._debug_log(f"{coin} 无持仓，准备开多")
         
         # 检查余额是否足够
         balance = self.okx_trader.get_balance()
@@ -456,7 +483,7 @@ class TradingEngine:
         
         available_balance = balance.get('available', 0)
         required_margin = (quantity * current_price) / leverage
-        print(f"[DEBUG] 模型 {self.model_id} {coin} 可用余额: {available_balance}, 需要保证金: {required_margin}")
+        self._debug_log(f"{coin} 可用余额: {available_balance}, 需要保证金: {required_margin}")
         
         if available_balance < required_margin:
             return {
@@ -465,7 +492,7 @@ class TradingEngine:
             }
         
         # 调用 OKX 下单（传入当前价格）
-        print(f"[DEBUG] 模型 {self.model_id} {coin} 调用 OKX 下单...")
+        self._debug_log(f"{coin} 调用 OKX 开多下单")
         okx_result = self.okx_trader.place_order(
             coin,
             'buy',
@@ -475,11 +502,11 @@ class TradingEngine:
             stop_loss,
             take_profit
         )
-        print(f"[DEBUG] 模型 {self.model_id} {coin} OKX 下单结果: {okx_result}")
+        self._debug_log(f"{coin} 开多下单结果: {okx_result}")
         
         if okx_result.get('success'):
              # 查询订单状态
-            print(f"[DEBUG] 模型 {self.model_id} 查询订单状态...")
+            self._debug_log(f"{coin} 查询开多订单状态")
             inst_id = config.OKX_SYMBOLS[coin]
             order_status = self.okx_trader.get_order_status(
                 okx_result.get('ord_id'),
@@ -534,15 +561,14 @@ class TradingEngine:
         self._validate_leverage(leverage)
         
         # 只检查 OKX 合约持仓，不检查钱包余额
-        print(f"[DEBUG] {coin} 检查 OKX 合约持仓...")
         okx_positions = self.okx_trader.get_positions()
-        print(f"[DEBUG] {coin} OKX 合约持仓: {okx_positions}")
+        self._debug_log(f"{coin} OKX 合约持仓检查完成")
         
         for pos in okx_positions:
             if pos['coin'] == coin:
                 return {'coin': coin, 'error': f'OKX 已有 {coin} 合约持仓'}
         
-        print(f"[DEBUG] {coin} 无持仓，准备做空")
+        self._debug_log(f"{coin} 无持仓，准备开空")
         
         # 检查余额是否足够
         balance = self.okx_trader.get_balance()
@@ -551,7 +577,7 @@ class TradingEngine:
         
         available_balance = balance.get('available', 0)
         required_margin = (quantity * current_price) / leverage
-        print(f"[DEBUG] {coin} 可用余额: {available_balance}, 需要保证金: {required_margin}")
+        self._debug_log(f"{coin} 可用余额: {available_balance}, 需要保证金: {required_margin}")
         
         if available_balance < required_margin:
             return {
@@ -560,7 +586,7 @@ class TradingEngine:
             }
         
         # 调用 OKX 下单（传入当前价格）
-        print(f"[DEBUG] {coin} 调用 OKX 做空...")
+        self._debug_log(f"{coin} 调用 OKX 开空下单")
         okx_result = self.okx_trader.place_order(
             coin,
             'sell',
@@ -570,7 +596,7 @@ class TradingEngine:
             stop_loss,
             take_profit
         )
-        print(f"[DEBUG] {coin} OKX 做空结果: {okx_result}")
+        self._debug_log(f"{coin} 开空下单结果: {okx_result}")
         
         if okx_result.get('success'):
              # 查询订单状态
@@ -579,7 +605,7 @@ class TradingEngine:
                 okx_result.get('ord_id'),
                 inst_id
             )
-            print(f"[DEBUG] 订单状态: {order_status}")
+            self._debug_log(f"{coin} 开空订单状态: {order_status}")
             # 同步记录到本地数据库
             self.db.update_position(
                 self.model_id,
@@ -633,12 +659,13 @@ class TradingEngine:
         current_contracts = position.get('contracts', position['size'])
         current_quantity = position.get('coin_quantity', 0.0)
         ai_quantity = float(decision.get('quantity', 0))
+        db_pos = self.db.get_position(self.model_id, coin, position['side'])
         
         # 根据 close_all 参数决定平仓数量
         if close_all:
             close_contracts = current_contracts
             close_quantity = current_quantity
-            print(f"[DEBUG] {coin} 全部平仓: {close_contracts} contracts ({close_quantity})")
+            self._debug_log(f"{coin} 全部平仓: {close_contracts} contracts ({close_quantity})")
         else:
             # 部分平仓
             if ai_quantity <= 0:
@@ -649,7 +676,7 @@ class TradingEngine:
                 market_state[coin]['price'],
                 round_up=True
             )
-            if requested_contracts > current_contracts:
+            if requested_contracts >= current_contracts:
                 close_contracts = current_contracts  # 不能超过持仓
                 close_quantity = current_quantity
             else:
@@ -662,7 +689,7 @@ class TradingEngine:
                         market_state[coin]['price']
                     )
                 )
-            print(f"[DEBUG] {coin} 部分平仓: {close_contracts} / {current_contracts} contracts")
+            self._debug_log(f"{coin} 部分平仓: {close_contracts} / {current_contracts} contracts")
         
         # 调用 OKX 平仓
         okx_result = self.okx_trader.close_position(
@@ -671,45 +698,94 @@ class TradingEngine:
         
         if okx_result.get('success'):
             current_price = market_state[coin]['price']
+            remaining_position = self._get_okx_position_after_order(
+                coin,
+                position['side'],
+                previous_contracts=current_contracts
+            )
+            remaining_contracts = remaining_position.get('contracts', remaining_position['size']) if remaining_position else 0
+            remaining_quantity = remaining_position.get('coin_quantity', 0.0) if remaining_position else 0.0
+            actual_closed_quantity = max(0.0, current_quantity - remaining_quantity)
+
+            if actual_closed_quantity <= 0:
+                return {
+                    'coin': coin,
+                    'error': f'OKX close order accepted but position did not decrease for {coin}'
+                }
+
             if position['side'] == 'long':
-                pnl = (current_price - position['avg_price']) * close_quantity
+                pnl = (current_price - position['avg_price']) * actual_closed_quantity
             else:
-                pnl = (position['avg_price'] - current_price) * close_quantity
+                pnl = (position['avg_price'] - current_price) * actual_closed_quantity
             
             # 更新数据库
-            if close_contracts >= current_contracts:
+            if remaining_contracts <= 0 or remaining_quantity <= 0:
                 # 全部平仓
                 self.db.close_position(self.model_id, coin, position['side'])
                 self.db.add_trade(
-                    self.model_id, coin, 'close_position', close_quantity,
+                    self.model_id, coin, 'close_position', actual_closed_quantity,
                     current_price, position['leverage'], position['side'], pnl=pnl
                 )
                 message = f'(OKX) Close all {coin}, P&L: ${pnl:.2f}'
+                result_signal = 'sell_to_close' if position['side'] == 'long' else 'buy_to_close'
             else:
                 # 部分平仓
-                remaining_position = self.db.reduce_position(
-                    self.model_id, coin, close_quantity, position['side']
+                self.db.update_position(
+                    self.model_id,
+                    coin,
+                    remaining_quantity,
+                    remaining_position['avg_price'],
+                    remaining_position['leverage'],
+                    position['side'],
+                    db_pos.get('stop_loss') if db_pos else None,
+                    db_pos.get('take_profit') if db_pos else None
                 )
-                remaining = remaining_position['quantity'] if remaining_position else 0
                 self.db.add_trade(
-                    self.model_id, coin, 'reduce_position', close_quantity,
+                    self.model_id, coin, 'reduce_position', actual_closed_quantity,
                     current_price, position['leverage'], position['side'], pnl=pnl
                 )
-                message = f'(OKX) Reduce {coin} by {close_quantity}, remaining {remaining}, P&L: ${pnl:.2f}'
+                message = f'(OKX) Reduce {coin} by {actual_closed_quantity}, remaining {remaining_quantity}, P&L: ${pnl:.2f}'
+                result_signal = 'reduce_position'
             
             return {
                 'coin': coin,
-                'signal': 'close_position' if close_all else 'reduce_position',
+                'signal': result_signal,
                 'okx_order_id': okx_result.get('ord_id'),
                 'pnl': pnl,
+                'closed_quantity': actual_closed_quantity,
+                'remaining_quantity': remaining_quantity,
                 'message': message
             }
         else:
-            print(f"[DEBUG] {coin} 平仓失败: {okx_result.get('error', 'Unknown error')}")
+            self._debug_log(f"{coin} 平仓失败: {okx_result.get('error', 'Unknown error')}")
             return {
                 'coin': coin,
                 'error': f'OKX close failed: {okx_result.get("error", "Unknown error")}'
             }
+
+    def _get_okx_position_after_order(self, coin: str, side: str, previous_contracts: float = None,
+                                      retries: int = 5, delay_seconds: float = 0.5) -> Dict:
+        """Re-fetch OKX position after an order and return the latest remaining position."""
+        last_position = None
+        for attempt in range(retries):
+            positions = self.okx_trader.get_positions() or []
+            matching_position = None
+            for pos in positions:
+                if pos['coin'] == coin and pos['side'] == side:
+                    matching_position = pos
+                    break
+
+            if previous_contracts is None:
+                return matching_position
+
+            remaining_contracts = matching_position.get('contracts', matching_position['size']) if matching_position else 0
+            if remaining_contracts < previous_contracts or attempt == retries - 1:
+                return matching_position
+
+            last_position = matching_position
+            time.sleep(delay_seconds)
+
+        return last_position
 
     def _execute_add_okx(self, coin: str, decision: Dict, market_state: Dict, portfolio: Dict) -> Dict:
         """OKX 部分加仓"""
@@ -740,7 +816,7 @@ class TradingEngine:
         if existing_position['side'] != 'long':
             return {'coin': coin, 'error': f'{coin} 已有空仓，不能做多加仓'}
         
-        print(f"[DEBUG] {coin} 已有持仓 {existing_position['size']}，准备加仓 {quantity}...")
+        self._debug_log(f"{coin} 已有持仓 {existing_position['size']}，准备加仓 {quantity}")
         
         # 检查余额
         balance = self.okx_trader.get_balance()

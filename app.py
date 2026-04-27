@@ -4,6 +4,7 @@ import time
 import threading
 from datetime import datetime
 import os
+import logging
 
 from trading_engine import TradingEngine
 from market_data import MarketDataFetcher
@@ -19,6 +20,7 @@ import config
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', '8XRxYeeymuCa2URjWcg6AIKPo')
 CORS(app, supports_credentials=True)
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 # 版本号用于缓存清理 - 使用当前时间戳
 import time
@@ -28,6 +30,31 @@ APP_VERSION = str(int(time.time()))
 @app.context_processor
 def inject_version():
     return {'app_version': APP_VERSION}
+
+def _should_log_request(log_key: str, interval_seconds: int = 180) -> bool:
+    now = time.time()
+    last_logged = _request_log_timestamps.get(log_key, 0)
+    if now - last_logged >= interval_seconds:
+        _request_log_timestamps[log_key] = now
+        return True
+    return False
+
+def _log_throttled_request(response):
+    if request.method != 'GET':
+        return
+    if not request.path.startswith('/api/'):
+        return
+    if response.status_code >= 400:
+        return
+
+    log_key = f'{request.method}:{request.path}:{response.status_code}'
+    if not _should_log_request(log_key):
+        return
+
+    remote_addr = request.remote_addr or '-'
+    timestamp = datetime.now().strftime('%d/%b/%Y %H:%M:%S')
+    full_path = request.full_path.rstrip('?')
+    print(f'{remote_addr} - - [{timestamp}] "{request.method} {full_path} HTTP/1.1" {response.status_code} -')
 
 # 设置缓存控制头
 @app.after_request
@@ -44,6 +71,7 @@ def after_request(response):
     elif response.content_type.startswith('text/html'):
         response.headers['Cache-Control'] = 'no-cache, must-revalidate'
         response.headers['Pragma'] = 'no-cache'
+    _log_throttled_request(response)
     return response
 
 db = Database(config.DATABASE_PATH)
@@ -53,6 +81,7 @@ performance_analyzer = PerformanceAnalyzer(db)
 backtester = None  # 延迟初始化
 trading_engines = {}
 auto_trading = config.AUTO_TRADING
+_request_log_timestamps = {}
 
 # ============ Helper Functions ============
 

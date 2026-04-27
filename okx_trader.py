@@ -27,6 +27,7 @@ class OKXTrader:
         )
         self.market_api = MarketData.MarketAPI(flag=config.OKX_FLAG)
         self._instrument_cache = {}
+        self._debug_timestamps = {}
         
         # 设置超时（如果 SDK 支持）
         try:
@@ -36,6 +37,14 @@ class OKXTrader:
                 pass
         except Exception as e:
             print(f"[INFO] 设置超时失败: {e}")
+
+    def _debug_log(self, key: str, message: str, interval_seconds: int = 180) -> None:
+        """Throttle noisy debug logs."""
+        now = time.time()
+        last_logged = self._debug_timestamps.get(key, 0)
+        if now - last_logged >= interval_seconds:
+            self._debug_timestamps[key] = now
+            print(message)
 
     def get_contract_face_value(self, coin: str) -> float:
         """Return the swap contract value in base coin units."""
@@ -162,11 +171,14 @@ class OKXTrader:
                     'details': details  # 保留原始数据用于调试
                 }
                 # 打印格式化的余额信息
-                print(f"[DEBUG] 获取余额成功: 总余额={total}, 币种数={len(balances)}")
+                self._debug_log('balance_summary', f"[DEBUG] 获取余额成功: 总余额={total}, 币种数={len(balances)}")
                 for ccy, balance in balances.items():
                     total_balance = balance['total'] - balance['frozen']
                     available_balance =total_balance-balance['frozen']
-                    print(f"[DEBUG] 币种：{ccy};总余额：{total_balance};已被占用余额：{balance['frozen']};可用余额：{available_balance}")
+                    self._debug_log(
+                        f'balance_detail:{ccy}',
+                        f"[DEBUG] 币种：{ccy};总余额：{total_balance};已被占用余额：{balance['frozen']};可用余额：{available_balance}"
+                    )
                 return result
             except Exception as e:
                 error_msg = str(e)
@@ -184,7 +196,10 @@ class OKXTrader:
                 config_result = self.account_api.get_account_config()
                 if config_result.get('code') == '0' and config_result.get('data'):
                     config_data = config_result.get('data', [{}])[0]
-                    print(f"[DEBUG] 账户配置: posMode={config_data.get('posMode')}, acctLv={config_data.get('acctLv')}")
+                    self._debug_log(
+                        'account_config_summary',
+                        f"[DEBUG] 账户配置: posMode={config_data.get('posMode')}, acctLv={config_data.get('acctLv')}"
+                    )
             except Exception as e:
                 print(f"[ERROR] 查询账户配置失败: {e}")
 
@@ -222,7 +237,10 @@ class OKXTrader:
                                 })
             # 打印持仓信息
             for idx, pos in enumerate(all_positions):
-                print(f"[DEBUG] 最终持仓 #{idx}: instId={pos['inst_id']}, pos={pos['size']}")
+                self._debug_log(
+                    f'final_position:{pos["inst_id"]}:{idx}',
+                    f"[DEBUG] 最终持仓 #{idx}: instId={pos['inst_id']}, pos={pos['size']}"
+                )
             return all_positions
         except Exception as e:
             print(f"[ERROR] 获取持仓信息失败: {e}")
@@ -264,12 +282,7 @@ class OKXTrader:
             contract_size = self.coin_quantity_to_contracts(coin, quantity, price)  # 按交易所规格对齐得到张数
 
             print(f"[DEBUG] 币数量: {quantity}, 当前价格: {price}, 订单价值: {contract_value} USDT")
-            print(f"[DEBUG] 每张面值: {face_value} USDT, 计算得张数: {contract_size} 张")
-
-            # 确保至少下单 1 张合约，满足 OKX 最小订单要求
-            if contract_size < 1:
-                contract_size = 1
-                print(f"[DEBUG] 订单价值低于最小要求，自动调整为 1 张合约")
+            print(f"[DEBUG] 每张合约价值: {face_value} {coin}, 计算得张数: {contract_size} 张")
 
             # 设置杠杆
             if leverage > 1:
@@ -418,7 +431,7 @@ class OKXTrader:
         """查询账户配置"""
         try:
             result = self.account_api.get_account_config()
-            print(f"[DEBUG] 账户配置: {result}")
+            self._debug_log('account_config_raw', f"[DEBUG] 账户配置: {result}")
             if result.get('code') == '0' and result.get('data'):
                 config_data = result.get('data', [{}])[0]
                 return {
@@ -435,3 +448,5 @@ class OKXTrader:
         except Exception as e:
             print(f"[ERROR] Get account config failed: {e}")
             return {'success': False, 'error': str(e)}
+
+# 测试代码

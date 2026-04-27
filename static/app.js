@@ -6,6 +6,13 @@ class TradingApp {
         this.klineChart = null;
         this.currentKlineCoin = 'BTC';
         this.klineColorMode = 'red-up'; // 默认红涨绿跌
+        this.trades = [];
+        this.tradeFilters = {
+            coin: '',
+            action: '',
+            search: '',
+            sortBy: 'time_desc'
+        };
         this.refreshIntervals = {
             market: null,
             portfolio: null,
@@ -84,6 +91,44 @@ class TradingApp {
         document.getElementById('klineColorToggle').addEventListener('click', () => {
             this.toggleKlineColor();
         });
+
+        const tradeCoinFilter = document.getElementById('tradeCoinFilter');
+        const tradeActionFilter = document.getElementById('tradeActionFilter');
+        const tradeSearchInput = document.getElementById('tradeSearchInput');
+        const tradeSortBy = document.getElementById('tradeSortBy');
+        const tradeFilterReset = document.getElementById('tradeFilterReset');
+
+        if (tradeCoinFilter) {
+            tradeCoinFilter.addEventListener('change', (e) => {
+                this.tradeFilters.coin = e.target.value;
+                this.renderFilteredTrades();
+            });
+        }
+
+        if (tradeActionFilter) {
+            tradeActionFilter.addEventListener('change', (e) => {
+                this.tradeFilters.action = e.target.value;
+                this.renderFilteredTrades();
+            });
+        }
+
+        if (tradeSearchInput) {
+            tradeSearchInput.addEventListener('input', (e) => {
+                this.tradeFilters.search = e.target.value.trim().toLowerCase();
+                this.renderFilteredTrades();
+            });
+        }
+
+        if (tradeSortBy) {
+            tradeSortBy.addEventListener('change', (e) => {
+                this.tradeFilters.sortBy = e.target.value;
+                this.renderFilteredTrades();
+            });
+        }
+
+        if (tradeFilterReset) {
+            tradeFilterReset.addEventListener('click', () => this.resetTradeFilters());
+        }
 
         // 加载保存的主题
         this.loadTheme();
@@ -224,6 +269,37 @@ class TradingApp {
                 el.className = `stat-value ${stats[index].class}`;
             }
         });
+        this.updateAccountTooltip(portfolio.wallet_balances || {});
+    }
+
+    updateAccountTooltip(walletBalances) {
+        const tooltipBody = document.getElementById('accountValueTooltipBody');
+        if (!tooltipBody) return;
+
+        const entries = Object.entries(walletBalances || {})
+            .filter(([, balance]) => {
+                const total = Number(balance?.total || 0);
+                const available = Number(balance?.available || 0);
+                const frozen = Number(balance?.frozen || 0);
+                return total !== 0 || available !== 0 || frozen !== 0;
+            })
+            .sort((a, b) => Number(b[1].total || 0) - Number(a[1].total || 0));
+
+        if (entries.length === 0) {
+            tooltipBody.innerHTML = '<div class="account-tooltip-empty">暂无余额数据</div>';
+            return;
+        }
+
+        tooltipBody.innerHTML = entries.map(([coin, balance]) => `
+            <div class="account-tooltip-row">
+                <div class="account-tooltip-coin">${coin}</div>
+                <div class="account-tooltip-values">
+                    <div>总额: ${Number(balance.total || 0).toFixed(6)}</div>
+                    <div>可用: ${Number(balance.available || 0).toFixed(6)}</div>
+                    <div>冻结: ${Number(balance.frozen || 0).toFixed(6)}</div>
+                </div>
+            </div>
+        `).join('');
     }
 
     updateChart(history, currentValue) {
@@ -363,7 +439,86 @@ class TradingApp {
     }
 
     updateTrades(trades) {
+        this.trades = Array.isArray(trades) ? trades : [];
+        this.renderFilteredTrades();
+    }
+
+    resetTradeFilters() {
+        this.tradeFilters = {
+            coin: '',
+            action: '',
+            search: '',
+            sortBy: 'time_desc'
+        };
+
+        const tradeCoinFilter = document.getElementById('tradeCoinFilter');
+        const tradeActionFilter = document.getElementById('tradeActionFilter');
+        const tradeSearchInput = document.getElementById('tradeSearchInput');
+        const tradeSortBy = document.getElementById('tradeSortBy');
+
+        if (tradeCoinFilter) tradeCoinFilter.value = '';
+        if (tradeActionFilter) tradeActionFilter.value = '';
+        if (tradeSearchInput) tradeSearchInput.value = '';
+        if (tradeSortBy) tradeSortBy.value = 'time_desc';
+
+        this.renderFilteredTrades();
+    }
+
+    getFilteredTrades() {
+        const signalMap = {
+            'buy_to_enter': '开多',
+            'sell_to_enter': '开空',
+            'reduce_position': '减仓',
+            'increase_position': '加仓',
+            'fixed_stop': '固定止损',
+            'close_position': '平仓',
+            'sell_to_close': '平多',
+            'buy_to_close': '平空',
+            'take_profit': '止盈',
+            'trailing_stop': '移动止损'
+        };
+
+        let trades = [...this.trades];
+
+        if (this.tradeFilters.coin) {
+            trades = trades.filter(trade => trade.coin === this.tradeFilters.coin);
+        }
+
+        if (this.tradeFilters.action) {
+            trades = trades.filter(trade => trade.signal === this.tradeFilters.action);
+        }
+
+        if (this.tradeFilters.search) {
+            trades = trades.filter(trade => {
+                const coin = (trade.coin || '').toLowerCase();
+                const signal = (trade.signal || '').toLowerCase();
+                const signalText = (signalMap[trade.signal] || '').toLowerCase();
+                return coin.includes(this.tradeFilters.search)
+                    || signal.includes(this.tradeFilters.search)
+                    || signalText.includes(this.tradeFilters.search);
+            });
+        }
+
+        trades.sort((a, b) => {
+            switch (this.tradeFilters.sortBy) {
+                case 'time_asc':
+                    return new Date(a.timestamp) - new Date(b.timestamp);
+                case 'pnl_desc':
+                    return (b.pnl || 0) - (a.pnl || 0);
+                case 'pnl_asc':
+                    return (a.pnl || 0) - (b.pnl || 0);
+                case 'time_desc':
+                default:
+                    return new Date(b.timestamp) - new Date(a.timestamp);
+            }
+        });
+
+        return trades;
+    }
+
+    renderFilteredTrades() {
         const tbody = document.getElementById('tradesBody');
+        const trades = this.getFilteredTrades();
         
         if (trades.length === 0) {
             tbody.innerHTML = '<tr><td colspan="6" class="empty-state">暂无交易记录</td></tr>';
@@ -374,6 +529,9 @@ class TradingApp {
             const signalMap = {
                 'buy_to_enter': { badge: 'badge-buy', text: '开多' },
                 'sell_to_enter': { badge: 'badge-sell', text: '开空' },
+                'reduce_position': { badge: 'badge-reduce', text: '减仓' },
+                'increase_position': { badge: 'badge-increase', text: '加仓' },
+                'fixed_stop': { badge: 'badge-fixed', text: '固定止损' },
                 'close_position': { badge: 'badge-close', text: '平仓' }
             };
             const signal = signalMap[trade.signal] || { badge: '', text: trade.signal };

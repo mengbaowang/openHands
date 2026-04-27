@@ -60,12 +60,18 @@
             <main class="app-main">
                 <!-- Stats Cards -->
                 <div class="stats-grid" id="statsGrid">
-                    <div class="stat-card">
+                    <div class="stat-card account-value-card" id="accountValueCard">
                         <div class="stat-header">
                             <span class="stat-label">账户总值</span>
                             <i class="bi bi-wallet2 text-primary"></i>
                         </div>
                         <div class="stat-value">$0.00</div>
+                        <div class="account-tooltip" id="accountValueTooltip">
+                            <div class="account-tooltip-title">账户币种明细</div>
+                            <div class="account-tooltip-body" id="accountValueTooltipBody">
+                                <div class="account-tooltip-empty">暂无余额数据</div>
+                            </div>
+                        </div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-header">
@@ -148,6 +154,50 @@
                     </div>
 
                     <div class="tab-content" id="tradesTab">
+                        <div class="table-toolbar trades-toolbar">
+                            <div class="toolbar-group">
+                                <label for="tradeCoinFilter">币种</label>
+                                <select id="tradeCoinFilter" class="toolbar-select">
+                                    <option value="">全部币种</option>
+                                    <option value="BTC">BTC</option>
+                                    <option value="ETH">ETH</option>
+                                    <option value="SOL">SOL</option>
+                                    <option value="BNB">BNB</option>
+                                    <option value="XRP">XRP</option>
+                                    <option value="DOGE">DOGE</option>
+                                </select>
+                            </div>
+                            <div class="toolbar-group">
+                                <label for="tradeActionFilter">操作</label>
+                                <select id="tradeActionFilter" class="toolbar-select">
+                                    <option value="">全部操作</option>
+                                    <option value="buy_to_enter">开多</option>
+                                    <option value="sell_to_enter">开空</option>
+                                    <option value="increase_position">加仓</option>
+                                    <option value="reduce_position">减仓</option>
+                                    <option value="close_position">平仓</option>
+                                    <option value="sell_to_close">平多</option>
+                                    <option value="buy_to_close">平空</option>
+                                    <option value="fixed_stop">固定止损</option>
+                                    <option value="take_profit">止盈</option>
+                                    <option value="trailing_stop">移动止损</option>
+                                </select>
+                            </div>
+                            <div class="toolbar-group toolbar-search">
+                                <label for="tradeSearchInput">搜索</label>
+                                <input id="tradeSearchInput" class="toolbar-input" type="text" placeholder="搜索币种或操作">
+                            </div>
+                            <div class="toolbar-group">
+                                <label for="tradeSortBy">排序</label>
+                                <select id="tradeSortBy" class="toolbar-select">
+                                    <option value="time_desc">时间: 最新优先</option>
+                                    <option value="time_asc">时间: 最早优先</option>
+                                    <option value="pnl_desc">盈亏: 从高到低</option>
+                                    <option value="pnl_asc">盈亏: 从低到高</option>
+                                </select>
+                            </div>
+                            <button id="tradeFilterReset" class="btn-secondary toolbar-reset">重置</button>
+                        </div>
                         <div class="table-container">
                             <table class="data-table">
                                 <thead>

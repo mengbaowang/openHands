@@ -1801,6 +1801,7 @@ body {
     border: 1px solid var(--border-1);
     box-shadow: var(--shadow-1);
     transition: all 0.2s;
+    position: relative;
 }
 
 .stat-card:hover {
@@ -1832,6 +1833,78 @@ body {
 
 .stat-value.negative {
     color: var(--danger);
+}
+
+.account-value-card {
+    cursor: help;
+}
+
+.account-tooltip {
+    position: absolute;
+    top: calc(100% + 10px);
+    left: 0;
+    width: 300px;
+    max-width: min(300px, 80vw);
+    background: var(--bg-1);
+    border: 1px solid var(--border-1);
+    border-radius: 14px;
+    box-shadow: var(--shadow-2);
+    padding: 14px;
+    z-index: 20;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(6px);
+    transition: opacity 0.18s ease, transform 0.18s ease, visibility 0.18s ease;
+}
+
+.account-value-card:hover .account-tooltip {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0);
+}
+
+.account-tooltip-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-1);
+    margin-bottom: 10px;
+}
+
+.account-tooltip-body {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.account-tooltip-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 0;
+    border-top: 1px solid var(--border-1);
+}
+
+.account-tooltip-row:first-child {
+    border-top: none;
+    padding-top: 0;
+}
+
+.account-tooltip-coin {
+    font-weight: 700;
+    color: var(--text-1);
+    min-width: 48px;
+}
+
+.account-tooltip-values {
+    text-align: right;
+    color: var(--text-2);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.account-tooltip-empty {
+    color: var(--text-3);
+    font-size: 12px;
 }
 
 .text-primary { color: var(--primary); }
@@ -1909,6 +1982,66 @@ body {
 /* Table */
 .table-container {
     overflow-x: auto;
+}
+
+.table-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: end;
+    justify-content: space-between;
+    margin-bottom: 16px;
+}
+
+.toolbar-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 140px;
+}
+
+.toolbar-group label {
+    font-size: 12px;
+    color: var(--text-2);
+    font-weight: 600;
+}
+
+.toolbar-select,
+.toolbar-input {
+    height: 38px;
+    padding: 0 12px;
+    border: 1px solid var(--border-1);
+    border-radius: 10px;
+    background: var(--bg-1);
+    color: var(--text-1);
+    font-size: 14px;
+}
+
+.toolbar-search {
+    flex: 1;
+    min-width: 220px;
+}
+
+.toolbar-reset {
+    height: 38px;
+    padding: 0 14px;
+    align-self: end;
+}
+
+@media (max-width: 768px) {
+    .table-toolbar {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .toolbar-group,
+    .toolbar-search {
+        min-width: 100%;
+    }
+
+    .toolbar-reset {
+        width: 100%;
+    }
 }
 
 .data-table {

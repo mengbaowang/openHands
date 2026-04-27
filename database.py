@@ -10,12 +10,22 @@ from typing import List, Dict, Optional
 class Database:
     def __init__(self, db_path: str = 'trading_bot.db'):
         self.db_path = db_path
+        self._okx_trader = None
         
     def get_connection(self):
         """Get database connection"""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def get_okx_trader(self):
+        """Reuse a single OKXTrader instance so throttled logs actually work."""
+        if self._okx_trader is not None:
+            return self._okx_trader
+
+        from okx_trader import OKXTrader
+        self._okx_trader = OKXTrader()
+        return self._okx_trader
     
     def init_db(self):
         """Initialize database tables"""
@@ -574,16 +584,11 @@ class Database:
 
     def _get_portfolio_from_okx(self, model_id: int, current_prices: Dict = None) -> Dict:
         """从 OKX API 获取投资组合（OKX 模式）"""
-        # 导入 OKXTrader
         try:
-            from okx_trader import OKXTrader
+            okx_trader = self.get_okx_trader()
         except ImportError:
             print("[ERROR] okx_trader 导入失败，降级到本地数据库")
             return self._get_portfolio_from_local(model_id, current_prices)
-        
-        # 创建 OKXTrader 实例
-        try:
-            okx_trader = OKXTrader()
         except Exception as e:
             print(f"[ERROR] OKXTrader 初始化失败：{e}，降级到本地数据库")
             return self._get_portfolio_from_local(model_id, current_prices)
@@ -635,13 +640,27 @@ class Database:
             
             positions_value = 0
             pos_details = []
+            unrealized_pnl = 0
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COALESCE(SUM(pnl), 0) as total_pnl FROM trades WHERE model_id = ?
+            ''', (model_id,))
+            realized_pnl = cursor.fetchone()['total_pnl']
+            conn.close()
             
             for pos in positions_data:
                 coin = pos['coin']
                 if coin in current_prices:
+                    current_price = current_prices[coin]
                     position_quantity = pos.get('coin_quantity', 0.0)
                     position_value = pos.get('notional_usdt', position_quantity * current_prices[coin])
                     positions_value += position_value
+                    if pos['side'] == 'long':
+                        pos_pnl = (current_price - pos['avg_price']) * position_quantity
+                    else:
+                        pos_pnl = (pos['avg_price'] - current_price) * position_quantity
+                    unrealized_pnl += pos_pnl
                     
                     db_pos = self.get_position(model_id, coin, pos['side'])
                     pos_details.append({
@@ -650,7 +669,9 @@ class Database:
                         'quantity': position_quantity,
                         'contracts': pos.get('contracts', pos.get('size')),
                         'avg_price': pos['avg_price'],
+                        'current_price': current_price,
                         'leverage': pos['leverage'],
+                        'pnl': pos_pnl,
                         'stop_loss': db_pos.get('stop_loss') if db_pos else None,
                         'take_profit': db_pos.get('take_profit') if db_pos else None,
                         'value': position_value
@@ -661,6 +682,8 @@ class Database:
                 'positions': pos_details,
                 'total_value': total_value,
                 'positions_value': positions_value,
+                'realized_pnl': realized_pnl,
+                'unrealized_pnl': unrealized_pnl,
                 'frozen_margin': frozen_margin,
                 'wallet_balances': wallet_balances
             }

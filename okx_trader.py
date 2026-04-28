@@ -5,6 +5,7 @@ from okx import Account, Trade, MarketData
 import config
 import time
 import requests
+import uuid
 
 class OKXTrader:
     """OKX 模拟盘交易器"""
@@ -259,6 +260,100 @@ class OKXTrader:
         except Exception as e:
             print(f"[ERROR] Get order status failed: {e}")
             return {'error': str(e)}
+
+    def place_native_risk_order(self, coin: str, side: str, contracts: float,
+                                stop_loss: float = None, take_profit: float = None,
+                                trigger_px_type: str = 'mark') -> dict:
+        """Place exchange-native TP/SL algo orders for an existing position."""
+        if stop_loss is None and take_profit is None:
+            return {'success': True, 'message': 'No TP/SL requested'}
+
+        inst_id = config.OKX_SYMBOLS.get(coin)
+        if not inst_id:
+            return {'success': False, 'error': f'Unsupported coin: {coin}'}
+
+        close_side = 'sell' if side == 'long' else 'buy'
+        algo_cl_ord_id = f"risk_{coin}_{side}_{uuid.uuid4().hex[:16]}"
+        params = {
+            'instId': inst_id,
+            'tdMode': 'cross',
+            'side': close_side,
+            'ordType': 'conditional',
+            'sz': str(contracts),
+            'posSide': side,
+            'reduceOnly': 'true',
+            'cxlOnClosePos': 'true',
+            'algoClOrdId': algo_cl_ord_id,
+        }
+        if take_profit is not None:
+            params['tpTriggerPx'] = str(take_profit)
+            params['tpOrdPx'] = '-1'
+            params['tpTriggerPxType'] = trigger_px_type
+        if stop_loss is not None:
+            params['slTriggerPx'] = str(stop_loss)
+            params['slOrdPx'] = '-1'
+            params['slTriggerPxType'] = trigger_px_type
+
+        result = self.trade_api.place_algo_order(**params)
+        if result.get('code') != '0':
+            return {'success': False, 'error': result.get('msg'), 'raw': result}
+
+        data = result.get('data', [{}])[0]
+        return {
+            'success': True,
+            'algo_id': data.get('algoId'),
+            'algo_cl_ord_id': algo_cl_ord_id,
+            'message': f'Native TP/SL placed for {coin}'
+        }
+
+    def amend_native_risk_order(self, coin: str, algo_id: str = None, algo_cl_ord_id: str = None,
+                                contracts: float = None, stop_loss: float = None,
+                                take_profit: float = None, trigger_px_type: str = 'mark') -> dict:
+        """Amend exchange-native TP/SL algo order."""
+        inst_id = config.OKX_SYMBOLS.get(coin)
+        if not inst_id:
+            return {'success': False, 'error': f'Unsupported coin: {coin}'}
+        if not algo_id and not algo_cl_ord_id:
+            return {'success': False, 'error': 'algo_id or algo_cl_ord_id is required'}
+
+        params = {
+            'instId': inst_id,
+            'algoId': algo_id or '',
+            'algoClOrdId': algo_cl_ord_id or '',
+        }
+        if contracts is not None:
+            params['newSz'] = str(contracts)
+        if take_profit is not None:
+            params['newTpTriggerPx'] = str(take_profit)
+            params['newTpOrdPx'] = '-1'
+            params['newTpTriggerPxType'] = trigger_px_type
+        if stop_loss is not None:
+            params['newSlTriggerPx'] = str(stop_loss)
+            params['newSlOrdPx'] = '-1'
+            params['newSlTriggerPxType'] = trigger_px_type
+
+        result = self.trade_api.amend_algo_order(**params)
+        if result.get('code') != '0':
+            return {'success': False, 'error': result.get('msg'), 'raw': result}
+        return {'success': True, 'message': f'Native TP/SL amended for {coin}'}
+
+    def cancel_native_risk_order(self, coin: str, algo_id: str = None, algo_cl_ord_id: str = None) -> dict:
+        """Cancel exchange-native TP/SL algo order."""
+        inst_id = config.OKX_SYMBOLS.get(coin)
+        if not inst_id:
+            return {'success': False, 'error': f'Unsupported coin: {coin}'}
+        if not algo_id and not algo_cl_ord_id:
+            return {'success': True, 'message': 'No native TP/SL order to cancel'}
+
+        params = [{
+            'instId': inst_id,
+            'algoId': algo_id or '',
+            'algoClOrdId': algo_cl_ord_id or ''
+        }]
+        result = self.trade_api.cancel_algo_order(params)
+        if result.get('code') != '0':
+            return {'success': False, 'error': result.get('msg'), 'raw': result}
+        return {'success': True, 'message': f'Native TP/SL canceled for {coin}'}
 
     def place_order(self, coin: str, side: str, quantity: float, price: float, leverage: int = 1, stop_loss: float = None, take_profit: float = None) -> dict:
         """

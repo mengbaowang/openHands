@@ -83,6 +83,10 @@ class Database:
                 side TEXT DEFAULT 'long',
                 stop_loss REAL,
                 take_profit REAL,
+                entry_ord_id TEXT,
+                okx_risk_algo_id TEXT,
+                okx_risk_algo_cl_ord_id TEXT,
+                trailing_tier REAL DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (model_id) REFERENCES models(id),
                 UNIQUE(model_id, coin, side)
@@ -99,6 +103,26 @@ class Database:
             cursor.execute('ALTER TABLE portfolios ADD COLUMN take_profit REAL')
         except:
             pass  # 字段已存在
+
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN entry_ord_id TEXT')
+        except:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN okx_risk_algo_id TEXT')
+        except:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN okx_risk_algo_cl_ord_id TEXT')
+        except:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN trailing_tier REAL DEFAULT 0')
+        except:
+            pass
         
         # Trades table
         cursor.execute('''
@@ -211,32 +235,47 @@ class Database:
     
     def update_position(self, model_id: int, coin: str, quantity: float,
                        avg_price: float, leverage: int = 1, side: str = 'long',
-                       stop_loss: float = None, take_profit: float = None):
+                       stop_loss: float = None, take_profit: float = None,
+                       entry_ord_id: str = None, okx_risk_algo_id: str = None,
+                       okx_risk_algo_cl_ord_id: str = None, trailing_tier: float = 0):
         """Update position with stop loss and take profit"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO portfolios (model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO portfolios (
+                model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
+                entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(model_id, coin, side) DO UPDATE SET
                 quantity = excluded.quantity,
                 avg_price = excluded.avg_price,
                 leverage = excluded.leverage,
                 stop_loss = excluded.stop_loss,
                 take_profit = excluded.take_profit,
+                entry_ord_id = excluded.entry_ord_id,
+                okx_risk_algo_id = excluded.okx_risk_algo_id,
+                okx_risk_algo_cl_ord_id = excluded.okx_risk_algo_cl_ord_id,
+                trailing_tier = excluded.trailing_tier,
                 updated_at = CURRENT_TIMESTAMP
-        ''', (model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit))
+        ''', (
+            model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
+            entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier
+        ))
         conn.commit()
         conn.close()
 
     def upsert_position_delta(self, model_id: int, coin: str, quantity_delta: float,
                               price: float, leverage: int = 1, side: str = 'long',
-                              stop_loss: float = None, take_profit: float = None) -> Dict:
+                              stop_loss: float = None, take_profit: float = None,
+                              entry_ord_id: str = None, okx_risk_algo_id: str = None,
+                              okx_risk_algo_cl_ord_id: str = None, trailing_tier: float = None) -> Dict:
         """Apply a quantity delta and keep a weighted average entry price."""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT quantity, avg_price, leverage, stop_loss, take_profit
+            SELECT quantity, avg_price, leverage, stop_loss, take_profit, entry_ord_id,
+                   okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier
             FROM portfolios
             WHERE model_id = ? AND coin = ? AND side = ?
         ''', (model_id, coin, side))
@@ -259,7 +298,11 @@ class Database:
                     'avg_price': 0.0,
                     'leverage': leverage,
                     'stop_loss': stop_loss,
-                    'take_profit': take_profit
+                    'take_profit': take_profit,
+                    'entry_ord_id': entry_ord_id,
+                    'okx_risk_algo_id': okx_risk_algo_id,
+                    'okx_risk_algo_cl_ord_id': okx_risk_algo_cl_ord_id,
+                    'trailing_tier': trailing_tier if trailing_tier is not None else 0
                 }
 
             weighted_avg_price = (
@@ -267,7 +310,9 @@ class Database:
             ) / new_quantity
             cursor.execute('''
                 UPDATE portfolios
-                SET quantity = ?, avg_price = ?, leverage = ?, stop_loss = ?, take_profit = ?, updated_at = CURRENT_TIMESTAMP
+                SET quantity = ?, avg_price = ?, leverage = ?, stop_loss = ?, take_profit = ?,
+                    entry_ord_id = ?, okx_risk_algo_id = ?, okx_risk_algo_cl_ord_id = ?, trailing_tier = ?,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE model_id = ? AND coin = ? AND side = ?
             ''', (
                 new_quantity,
@@ -275,6 +320,10 @@ class Database:
                 leverage,
                 stop_loss if stop_loss is not None else existing['stop_loss'],
                 take_profit if take_profit is not None else existing['take_profit'],
+                entry_ord_id if entry_ord_id is not None else existing['entry_ord_id'],
+                okx_risk_algo_id if okx_risk_algo_id is not None else existing['okx_risk_algo_id'],
+                okx_risk_algo_cl_ord_id if okx_risk_algo_cl_ord_id is not None else existing['okx_risk_algo_cl_ord_id'],
+                trailing_tier if trailing_tier is not None else existing['trailing_tier'],
                 model_id,
                 coin,
                 side
@@ -286,13 +335,23 @@ class Database:
                 'avg_price': weighted_avg_price,
                 'leverage': leverage,
                 'stop_loss': stop_loss if stop_loss is not None else existing['stop_loss'],
-                'take_profit': take_profit if take_profit is not None else existing['take_profit']
+                'take_profit': take_profit if take_profit is not None else existing['take_profit'],
+                'entry_ord_id': entry_ord_id if entry_ord_id is not None else existing['entry_ord_id'],
+                'okx_risk_algo_id': okx_risk_algo_id if okx_risk_algo_id is not None else existing['okx_risk_algo_id'],
+                'okx_risk_algo_cl_ord_id': okx_risk_algo_cl_ord_id if okx_risk_algo_cl_ord_id is not None else existing['okx_risk_algo_cl_ord_id'],
+                'trailing_tier': trailing_tier if trailing_tier is not None else existing['trailing_tier']
             }
 
         cursor.execute('''
-            INSERT INTO portfolios (model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (model_id, coin, float(quantity_delta), float(price), leverage, side, stop_loss, take_profit))
+            INSERT INTO portfolios (
+                model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
+                entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (
+            model_id, coin, float(quantity_delta), float(price), leverage, side, stop_loss, take_profit,
+            entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier if trailing_tier is not None else 0
+        ))
         conn.commit()
         conn.close()
         return {
@@ -300,7 +359,11 @@ class Database:
             'avg_price': float(price),
             'leverage': leverage,
             'stop_loss': stop_loss,
-            'take_profit': take_profit
+            'take_profit': take_profit,
+            'entry_ord_id': entry_ord_id,
+            'okx_risk_algo_id': okx_risk_algo_id,
+            'okx_risk_algo_cl_ord_id': okx_risk_algo_cl_ord_id,
+            'trailing_tier': trailing_tier if trailing_tier is not None else 0
         }
 
     def reduce_position(self, model_id: int, coin: str, quantity_delta: float, side: str = 'long') -> Optional[Dict]:
@@ -308,7 +371,8 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT quantity, avg_price, leverage, stop_loss, take_profit
+            SELECT quantity, avg_price, leverage, stop_loss, take_profit, entry_ord_id,
+                   okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier
             FROM portfolios
             WHERE model_id = ? AND coin = ? AND side = ?
         ''', (model_id, coin, side))
@@ -332,7 +396,11 @@ class Database:
                 'avg_price': float(existing['avg_price']),
                 'leverage': int(existing['leverage']),
                 'stop_loss': existing['stop_loss'],
-                'take_profit': existing['take_profit']
+                'take_profit': existing['take_profit'],
+                'entry_ord_id': existing['entry_ord_id'],
+                'okx_risk_algo_id': existing['okx_risk_algo_id'],
+                'okx_risk_algo_cl_ord_id': existing['okx_risk_algo_cl_ord_id'],
+                'trailing_tier': existing['trailing_tier']
             }
 
         cursor.execute('''
@@ -347,7 +415,11 @@ class Database:
             'avg_price': float(existing['avg_price']),
             'leverage': int(existing['leverage']),
             'stop_loss': existing['stop_loss'],
-            'take_profit': existing['take_profit']
+            'take_profit': existing['take_profit'],
+            'entry_ord_id': existing['entry_ord_id'],
+            'okx_risk_algo_id': existing['okx_risk_algo_id'],
+            'okx_risk_algo_cl_ord_id': existing['okx_risk_algo_cl_ord_id'],
+            'trailing_tier': existing['trailing_tier']
         }
     
     
@@ -701,7 +773,8 @@ class Database:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT stop_loss, take_profit
+            SELECT stop_loss, take_profit, entry_ord_id, okx_risk_algo_id,
+                   okx_risk_algo_cl_ord_id, trailing_tier
             FROM portfolios
             WHERE model_id = ? AND coin = ? AND side = ?
         ''', (model_id, coin, side))

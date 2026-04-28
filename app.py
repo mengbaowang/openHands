@@ -6,6 +6,11 @@ from datetime import datetime
 import os
 import logging
 
+import config
+from utils.logger import setup_runtime_logging
+
+setup_runtime_logging(config.LOG_FILE)
+
 from trading_engine import TradingEngine
 from market_data import MarketDataFetcher
 from ai_trader import AITrader
@@ -15,7 +20,6 @@ from services.backtester import Backtester
 from services.performance_analyzer import PerformanceAnalyzer
 from utils.auth import hash_password, verify_password, login_required, get_current_user_id, set_current_user, clear_current_user
 from utils.timezone import get_current_utc_time_str, get_current_beijing_time_str, utc_to_beijing
-import config
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', '8XRxYeeymuCa2URjWcg6AIKPo')

@@ -24,6 +24,16 @@ if config.TRADING_MODE == 'okx_demo':
 
 
 class TradingEngine:
+    DEFAULT_STOP_LOSS_PCT = 0.03
+    DEFAULT_TAKE_PROFIT_PCT = 0.06
+    OKX_TRAILING_STEPS = [
+        (0.03, 0.00),  # 盈利 3% 后移到保本
+        (0.05, 0.02),  # 盈利 5% 后锁定 2% 利润
+        (0.10, 0.05),  # 盈利 10% 后锁定 5% 利润
+        (0.15, 0.10),  # 盈利 15% 后锁定 10% 利润
+        (0.20, 0.15),  # 盈利 20% 后锁定 15% 利润
+    ]
+
     def __init__(self, model_id: int, db, market_fetcher, ai_trader):
         self.model_id = model_id
         self.db = db
@@ -53,6 +63,77 @@ class TradingEngine:
         for item in self._cycle_logs:
             print(f"  {item}")
         self._cycle_logs = []
+
+    def _calculate_okx_trailing_stop(self, entry_price: float, side: str, profit_pct: float):
+        """Return the trailing tier and desired stop-loss based on current profit."""
+        selected_tier = 0.0
+        desired_stop_loss = None
+        for threshold, locked_profit in self.OKX_TRAILING_STEPS:
+            if profit_pct >= threshold:
+                selected_tier = threshold
+                if side == 'long':
+                    desired_stop_loss = entry_price * (1 + locked_profit)
+                else:
+                    desired_stop_loss = entry_price * (1 - locked_profit)
+        return selected_tier, desired_stop_loss
+
+    def _resolve_risk_targets(self, side: str, reference_price: float,
+                              stop_loss: float = None, take_profit: float = None):
+        """Fill missing stop-loss / take-profit values with sensible defaults."""
+        if stop_loss is None:
+            stop_loss = reference_price * (1 - self.DEFAULT_STOP_LOSS_PCT) if side == 'long' else reference_price * (1 + self.DEFAULT_STOP_LOSS_PCT)
+        if take_profit is None:
+            take_profit = reference_price * (1 + self.DEFAULT_TAKE_PROFIT_PCT) if side == 'long' else reference_price * (1 - self.DEFAULT_TAKE_PROFIT_PCT)
+        return stop_loss, take_profit
+
+    def _sync_okx_native_risk_order(self, coin: str, side: str, contracts: float,
+                                    stop_loss: float = None, take_profit: float = None,
+                                    db_pos: Dict = None) -> Dict:
+        """Ensure one exchange-native TP/SL algo order exists and matches the desired settings."""
+        algo_id = db_pos.get('okx_risk_algo_id') if db_pos else None
+        algo_cl_ord_id = db_pos.get('okx_risk_algo_cl_ord_id') if db_pos else None
+
+        if stop_loss is None and take_profit is None:
+            if algo_id or algo_cl_ord_id:
+                cancel_result = self.okx_trader.cancel_native_risk_order(coin, algo_id, algo_cl_ord_id)
+                if not cancel_result.get('success'):
+                    self._debug_log(f"{coin} 撤销原生 TP/SL 失败: {cancel_result}")
+                return {'success': cancel_result.get('success', True), 'algo_id': None, 'algo_cl_ord_id': None}
+            return {'success': True, 'algo_id': None, 'algo_cl_ord_id': None}
+
+        if algo_id or algo_cl_ord_id:
+            amend_result = self.okx_trader.amend_native_risk_order(
+                coin,
+                algo_id=algo_id,
+                algo_cl_ord_id=algo_cl_ord_id,
+                contracts=contracts,
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
+            if amend_result.get('success'):
+                return {
+                    'success': True,
+                    'algo_id': algo_id,
+                    'algo_cl_ord_id': algo_cl_ord_id,
+                    'action': 'amended'
+                }
+            self._debug_log(f"{coin} 修改原生 TP/SL 失败，尝试重建: {amend_result}")
+            self.okx_trader.cancel_native_risk_order(coin, algo_id, algo_cl_ord_id)
+
+        place_result = self.okx_trader.place_native_risk_order(
+            coin,
+            side=side,
+            contracts=contracts,
+            stop_loss=stop_loss,
+            take_profit=take_profit
+        )
+        return {
+            'success': place_result.get('success', False),
+            'algo_id': place_result.get('algo_id'),
+            'algo_cl_ord_id': place_result.get('algo_cl_ord_id'),
+            'action': 'placed',
+            'error': place_result.get('error')
+        }
 
     def _validate_quantity(self, quantity: float, coin: str) -> None:
         """验证交易数量"""
@@ -236,20 +317,7 @@ class TradingEngine:
         }
 
     def _check_stop_loss_take_profit_okx(self, portfolio: Dict, current_prices: Dict) -> list:
-        """OKX 模式下的止盈止损检查（支持阶梯式移动止损）"""
-        
-        # ========== 阶梯式移动止损配置 ==========
-        # 格式: (盈利阈值, 止损距离 entry_price 的百分比)
-        # 例如: (0.03, 0.01) 表示盈利 3% 时，止损在成本价的 99%（即保留 1% 缓冲）
-        TRAILING_STEPS = [
-            (0.03, 0.01),   # 盈利 3%  → 止损在 entry × 0.99（1% 缓冲）
-            (0.05, 0.02),   # 盈利 5%  → 止损在 entry × 0.98（2% 缓冲）
-            (0.10, 0.03),   # 盈利 10% → 止损在 entry × 0.97（3% 缓冲）
-            (0.15, 0.05),   # 盈利 15% → 止损在 entry × 0.95（5% 缓冲）
-            (0.20, 0.00),   # 盈利 20% → 止损在 entry × 1.00（成本价，100% 保住利润）
-        ]
-        # ========================================
-        
+        """OKX 模式下维护交易所原生止盈止损单，并根据盈利阶段移动止损线。"""
         results = []
         
         for position in portfolio['positions']:
@@ -268,89 +336,76 @@ class TradingEngine:
                 profit_pct = (current_price - entry_price) / entry_price
             else:
                 profit_pct = (entry_price - current_price) / entry_price
-            
-            # ===== 计算阶梯止损价 =====
-            trailing_stop_loss = None
-            current_tier = None
-            
-            for threshold, buffer in TRAILING_STEPS:
-                if profit_pct >= threshold:
-                    if side == 'long':
-                        trailing_stop_loss = entry_price * (1 - buffer)
-                    else:
-                        trailing_stop_loss = entry_price * (1 + buffer)
-                    current_tier = threshold
-                    buffer_pct = int(buffer * 100)
-            
-            # 打印移动止损信息（只在跨过新台阶时）
-            if trailing_stop_loss and current_tier:
-                self._debug_log(f"{coin} 当前盈利 {profit_pct*100:.1f}%, 止损阶梯 {current_tier*100:.0f}%: ${trailing_stop_loss:.2f}")
-            
-            # ===== 检查是否触发止盈止损 =====
-            should_close = False
-            reason = ''
-            triggered_by = ''
-            
-            # 1. 检查阶梯止损
-            if trailing_stop_loss:
-                if side == 'long' and current_price <= trailing_stop_loss:
-                    should_close = True
-                    reason = f'阶梯止损触发 ({current_tier*100:.0f}%盈利阶梯, ${current_price:.2f} <= ${trailing_stop_loss:.2f})'
-                    triggered_by = 'trailing_stop'
-                elif side == 'short' and current_price >= trailing_stop_loss:
-                    should_close = True
-                    reason = f'阶梯止损触发 ({current_tier*100:.0f}%盈利阶梯, ${current_price:.2f} >= ${trailing_stop_loss:.2f})'
-                    triggered_by = 'trailing_stop'
-            
-            # 2. 检查固定止损（如果盈利未达到任何阶梯）
-            if not should_close and stop_loss:
-                if side == 'long' and current_price <= stop_loss:
-                    should_close = True
-                    reason = f'止损触发 (固定, ${current_price:.2f} <= ${stop_loss:.2f})'
-                    triggered_by = 'fixed_stop'
-                elif side == 'short' and current_price >= stop_loss:
-                    should_close = True
-                    reason = f'止损触发 (固定, ${current_price:.2f} >= ${stop_loss:.2f})'
-                    triggered_by = 'fixed_stop'
-            
-            # 3. 检查止盈
-            if take_profit and not should_close:
-                if side == 'long' and current_price >= take_profit:
-                    should_close = True
-                    reason = f'止盈触发 (${current_price:.2f} >= ${take_profit:.2f})'
-                    triggered_by = 'take_profit'
-                elif side == 'short' and current_price <= take_profit:
-                    should_close = True
-                    reason = f'止盈触发 (${current_price:.2f} <= ${take_profit:.2f})'
-                    triggered_by = 'take_profit'
-            
-            # ===== 执行平仓 =====
-            if should_close:
-                close_contracts = position.get('contracts', position.get('size', 0))
-                okx_result = self.okx_trader.close_position(coin, side, close_contracts)
-                
-                if okx_result.get('success'):
-                    quantity = position.get('quantity', position.get('coin_quantity', 0))
-                    if side == 'long':
-                        pnl = (current_price - entry_price) * quantity
-                    else:
-                        pnl = (entry_price - current_price) * quantity
-                    
-                    self.db.close_position(self.model_id, coin, side)
-                    self.db.add_trade(
-                        self.model_id, coin, triggered_by, quantity,
-                        current_price, position['leverage'], side, pnl=pnl
+
+            db_pos = self.db.get_position(self.model_id, coin, side) or {}
+            current_tier = float(db_pos.get('trailing_tier') or 0)
+            desired_tier, desired_stop_loss = self._calculate_okx_trailing_stop(entry_price, side, profit_pct)
+
+            if desired_stop_loss is not None:
+                improved = (
+                    stop_loss is None or
+                    (side == 'long' and desired_stop_loss > stop_loss) or
+                    (side == 'short' and desired_stop_loss < stop_loss)
+                )
+                if improved and desired_tier > current_tier:
+                    self._debug_log(
+                        f"{coin} 盈利 {profit_pct*100:.1f}% 达到 {desired_tier*100:.0f}% 阶段，移动止损到 ${desired_stop_loss:.2f}"
                     )
-                    
-                    results.append({
-                        'coin': coin,
-                        'signal': triggered_by,
-                        'reason': reason,
-                        'quantity': quantity,
-                        'price': current_price,
-                        'pnl': pnl,
-                        'message': f'{coin} {reason}, P&L: ${pnl:.2f} (OKX)'
-                    })
+                    risk_sync = self._sync_okx_native_risk_order(
+                        coin,
+                        side=side,
+                        contracts=position.get('contracts', position.get('size', 0)),
+                        stop_loss=desired_stop_loss,
+                        take_profit=take_profit,
+                        db_pos=db_pos
+                    )
+                    self._debug_log(f"{coin} 原生 TP/SL 移动结果: {risk_sync}")
+                    if risk_sync.get('success'):
+                        self.db.update_position(
+                            self.model_id,
+                            coin,
+                            position.get('quantity', position.get('coin_quantity', 0.0)),
+                            entry_price,
+                            position['leverage'],
+                            side,
+                            desired_stop_loss,
+                            take_profit,
+                            entry_ord_id=db_pos.get('entry_ord_id'),
+                            okx_risk_algo_id=risk_sync.get('algo_id'),
+                            okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
+                            trailing_tier=desired_tier
+                        )
+                        results.append({
+                            'coin': coin,
+                            'signal': 'move_stop_loss',
+                            'price': current_price,
+                            'message': f'{coin} 已将交易所止损上移到 ${desired_stop_loss:.2f}'
+                        })
+            elif stop_loss is not None or take_profit is not None:
+                # 如果没有达到任何移动阶段，至少确保原生 TP/SL 单存在
+                risk_sync = self._sync_okx_native_risk_order(
+                    coin,
+                    side=side,
+                    contracts=position.get('contracts', position.get('size', 0)),
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    db_pos=db_pos
+                )
+                if risk_sync.get('success') and (risk_sync.get('algo_id') or risk_sync.get('algo_cl_ord_id')):
+                    self.db.update_position(
+                        self.model_id,
+                        coin,
+                        position.get('quantity', position.get('coin_quantity', 0.0)),
+                        entry_price,
+                        position['leverage'],
+                        side,
+                        stop_loss,
+                        take_profit,
+                        entry_ord_id=db_pos.get('entry_ord_id'),
+                        okx_risk_algo_id=risk_sync.get('algo_id'),
+                        okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
+                        trailing_tier=current_tier
+                    )
         
         return results
 
@@ -465,6 +520,7 @@ class TradingEngine:
         # 验证输入
         self._validate_quantity(quantity, coin)
         self._validate_leverage(leverage)
+        stop_loss, take_profit = self._resolve_risk_targets('long', current_price, stop_loss, take_profit)
         
         # 只检查 OKX 合约持仓，不检查钱包余额
         okx_positions = self.okx_trader.get_positions()
@@ -507,29 +563,44 @@ class TradingEngine:
         if okx_result.get('success'):
              # 查询订单状态
             self._debug_log(f"{coin} 查询开多订单状态")
+            entry_ord_id = okx_result.get('ord_id')
             inst_id = config.OKX_SYMBOLS[coin]
             order_status = self.okx_trader.get_order_status(
-                okx_result.get('ord_id'),
+                entry_ord_id,
                 inst_id
             )
-            #print(f"[DEBUG] 模型 {self.model_id} {coin} 订单状态: {order_status}")
-            # 同步记录到本地数据库
+            actual_position = self._get_okx_position_after_order(coin, 'long')
+            actual_quantity = actual_position.get('coin_quantity', quantity) if actual_position else quantity
+            actual_contracts = actual_position.get('contracts', self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)) if actual_position else self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)
+            avg_price = actual_position.get('avg_price', current_price) if actual_position else current_price
+            risk_sync = self._sync_okx_native_risk_order(
+                coin,
+                side='long',
+                contracts=actual_contracts,
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
+            self._debug_log(f"{coin} 原生 TP/SL 挂单结果: {risk_sync}")
             self.db.update_position(
                 self.model_id,
                 coin,
-                quantity,
-                current_price,
+                actual_quantity,
+                avg_price,
                 leverage,
                 'long',
                 stop_loss,
-                take_profit
+                take_profit,
+                entry_ord_id=entry_ord_id,
+                okx_risk_algo_id=risk_sync.get('algo_id'),
+                okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
+                trailing_tier=0
             )
             self.db.add_trade(
                 self.model_id,
                 coin,
                 'buy_to_enter',
-                quantity,
-                current_price,
+                actual_quantity,
+                avg_price,
                 leverage,
                 'long',
                 pnl=0
@@ -537,8 +608,9 @@ class TradingEngine:
             return {
                 'coin': coin,
                 'signal': 'buy_to_enter',
-                'okx_order_id': okx_result.get('ord_id'),
-                'message': okx_result.get('message', f'(OKX) Long {quantity:.4f} {coin}')
+                'okx_order_id': entry_ord_id,
+                'message': okx_result.get('message', f'(OKX) Long {actual_quantity:.4f} {coin}'),
+                'warning': None if risk_sync.get('success') else f'Native TP/SL setup failed: {risk_sync.get("error")}'
             }
         else:
             return {
@@ -559,6 +631,7 @@ class TradingEngine:
         # 验证输入
         self._validate_quantity(quantity, coin)
         self._validate_leverage(leverage)
+        stop_loss, take_profit = self._resolve_risk_targets('short', current_price, stop_loss, take_profit)
         
         # 只检查 OKX 合约持仓，不检查钱包余额
         okx_positions = self.okx_trader.get_positions()
@@ -600,29 +673,45 @@ class TradingEngine:
         
         if okx_result.get('success'):
              # 查询订单状态
+            entry_ord_id = okx_result.get('ord_id')
             inst_id = config.OKX_SYMBOLS[coin]
             order_status = self.okx_trader.get_order_status(
-                okx_result.get('ord_id'),
+                entry_ord_id,
                 inst_id
             )
             self._debug_log(f"{coin} 开空订单状态: {order_status}")
-            # 同步记录到本地数据库
+            actual_position = self._get_okx_position_after_order(coin, 'short')
+            actual_quantity = actual_position.get('coin_quantity', quantity) if actual_position else quantity
+            actual_contracts = actual_position.get('contracts', self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)) if actual_position else self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)
+            avg_price = actual_position.get('avg_price', current_price) if actual_position else current_price
+            risk_sync = self._sync_okx_native_risk_order(
+                coin,
+                side='short',
+                contracts=actual_contracts,
+                stop_loss=stop_loss,
+                take_profit=take_profit
+            )
+            self._debug_log(f"{coin} 原生 TP/SL 挂单结果: {risk_sync}")
             self.db.update_position(
                 self.model_id,
                 coin,
-                quantity,
-                current_price,
+                actual_quantity,
+                avg_price,
                 leverage,
                 'short',
                 stop_loss,
-                take_profit
+                take_profit,
+                entry_ord_id=entry_ord_id,
+                okx_risk_algo_id=risk_sync.get('algo_id'),
+                okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
+                trailing_tier=0
             )
             self.db.add_trade(
                 self.model_id,
                 coin,
                 'sell_to_enter',
-                quantity,
-                current_price,
+                actual_quantity,
+                avg_price,
                 leverage,
                 'short',
                 pnl=0
@@ -630,8 +719,9 @@ class TradingEngine:
             return {
                 'coin': coin,
                 'signal': 'sell_to_enter',
-                'okx_order_id': okx_result.get('ord_id'),
-                'message': okx_result.get('message', f'(OKX) Short {quantity:.4f} {coin}')
+                'okx_order_id': entry_ord_id,
+                'message': okx_result.get('message', f'(OKX) Short {actual_quantity:.4f} {coin}'),
+                'warning': None if risk_sync.get('success') else f'Native TP/SL setup failed: {risk_sync.get("error")}'
             }
         else:
             return {
@@ -721,6 +811,14 @@ class TradingEngine:
             # 更新数据库
             if remaining_contracts <= 0 or remaining_quantity <= 0:
                 # 全部平仓
+                self._sync_okx_native_risk_order(
+                    coin,
+                    side=position['side'],
+                    contracts=0,
+                    stop_loss=None,
+                    take_profit=None,
+                    db_pos=db_pos
+                )
                 self.db.close_position(self.model_id, coin, position['side'])
                 self.db.add_trade(
                     self.model_id, coin, 'close_position', actual_closed_quantity,
@@ -730,6 +828,14 @@ class TradingEngine:
                 result_signal = 'sell_to_close' if position['side'] == 'long' else 'buy_to_close'
             else:
                 # 部分平仓
+                risk_sync = self._sync_okx_native_risk_order(
+                    coin,
+                    side=position['side'],
+                    contracts=remaining_contracts,
+                    stop_loss=db_pos.get('stop_loss') if db_pos else None,
+                    take_profit=db_pos.get('take_profit') if db_pos else None,
+                    db_pos=db_pos
+                )
                 self.db.update_position(
                     self.model_id,
                     coin,
@@ -738,7 +844,11 @@ class TradingEngine:
                     remaining_position['leverage'],
                     position['side'],
                     db_pos.get('stop_loss') if db_pos else None,
-                    db_pos.get('take_profit') if db_pos else None
+                    db_pos.get('take_profit') if db_pos else None,
+                    entry_ord_id=db_pos.get('entry_ord_id') if db_pos else None,
+                    okx_risk_algo_id=risk_sync.get('algo_id') if risk_sync else db_pos.get('okx_risk_algo_id') if db_pos else None,
+                    okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id') if risk_sync else db_pos.get('okx_risk_algo_cl_ord_id') if db_pos else None,
+                    trailing_tier=db_pos.get('trailing_tier') if db_pos else 0
                 )
                 self.db.add_trade(
                     self.model_id, coin, 'reduce_position', actual_closed_quantity,
@@ -776,7 +886,11 @@ class TradingEngine:
                     break
 
             if previous_contracts is None:
-                return matching_position
+                if matching_position or attempt == retries - 1:
+                    return matching_position
+                last_position = matching_position
+                time.sleep(delay_seconds)
+                continue
 
             remaining_contracts = matching_position.get('contracts', matching_position['size']) if matching_position else 0
             if remaining_contracts < previous_contracts or attempt == retries - 1:
@@ -815,8 +929,9 @@ class TradingEngine:
         # 只能对同方向加仓
         if existing_position['side'] != 'long':
             return {'coin': coin, 'error': f'{coin} 已有空仓，不能做多加仓'}
-        
+
         self._debug_log(f"{coin} 已有持仓 {existing_position['size']}，准备加仓 {quantity}")
+        stop_loss, take_profit = self._resolve_risk_targets('long', current_price, stop_loss, take_profit)
         
         # 检查余额
         balance = self.okx_trader.get_balance()
@@ -838,10 +953,41 @@ class TradingEngine:
         )
         
         if okx_result.get('success'):
-            position_state = self.db.upsert_position_delta(
-                self.model_id, coin, quantity, current_price, leverage, 'long',
-                stop_loss, take_profit
+            db_pos = self.db.get_position(self.model_id, coin, 'long') or {}
+            previous_contracts = existing_position.get('contracts', existing_position['size'])
+            actual_position = self._get_okx_position_after_order(coin, 'long', previous_contracts=previous_contracts)
+            total_quantity = actual_position.get('coin_quantity', existing_position.get('coin_quantity', 0.0) + quantity) if actual_position else existing_position.get('coin_quantity', 0.0) + quantity
+            total_contracts = actual_position.get('contracts', previous_contracts) if actual_position else previous_contracts
+            avg_price = actual_position.get('avg_price', current_price) if actual_position else current_price
+            effective_stop_loss = stop_loss if stop_loss is not None else db_pos.get('stop_loss')
+            effective_take_profit = take_profit if take_profit is not None else db_pos.get('take_profit')
+            risk_sync = self._sync_okx_native_risk_order(
+                coin,
+                side='long',
+                contracts=total_contracts,
+                stop_loss=effective_stop_loss,
+                take_profit=effective_take_profit,
+                db_pos=db_pos
             )
+            self._debug_log(f"{coin} 原生 TP/SL 更新结果: {risk_sync}")
+            self.db.update_position(
+                self.model_id,
+                coin,
+                total_quantity,
+                avg_price,
+                leverage,
+                'long',
+                effective_stop_loss,
+                effective_take_profit,
+                entry_ord_id=okx_result.get('ord_id'),
+                okx_risk_algo_id=risk_sync.get('algo_id'),
+                okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
+                trailing_tier=0
+            )
+            position_state = {
+                'quantity': total_quantity,
+                'avg_price': avg_price
+            }
             self.db.add_trade(
                 self.model_id, coin, 'increase_position', quantity, current_price,
                 leverage, 'long', pnl=0
@@ -850,7 +996,8 @@ class TradingEngine:
                 'coin': coin,
                 'signal': 'increase_position',
                 'okx_order_id': okx_result.get('ord_id'),
-                'message': f'(OKX) Add to long {coin} +{quantity:.4f}, total {position_state["quantity"]}'
+                'message': f'(OKX) Add to long {coin} +{quantity:.4f}, total {position_state["quantity"]}',
+                'warning': None if risk_sync.get('success') else f'Native TP/SL update failed: {risk_sync.get("error")}'
             }
         else:
             return {

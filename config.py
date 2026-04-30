@@ -63,8 +63,8 @@ OKX_API_URL = 'https://www.okx.com/api/v5'
 
 
 # OKX API 配置
-OKX_API_KEY = os.getenv('OKX_API_KEY', 'cfdb8f59-d2a4-4be1-8675-6f16e19e22de')
-OKX_API_SECRET = os.getenv('OKX_API_SECRET', '293C6B25518060439A29E0ABBE1CD2E9')
+OKX_API_KEY = os.getenv('OKX_API_KEY', '83a3f1d1-e6f4-4f48-abe4-eec5b8f91c54')
+OKX_API_SECRET = os.getenv('OKX_API_SECRET', '4C4D384D0692A86ECA60F8EC01A47FB3')
 OKX_PASSPHRASE = os.getenv('OKX_PASSPHRASE', 'Mengbaowang666.')
 OKX_FLAG = '1'  # 1=模拟盘, 0=实盘
 # ============ 前端刷新频率 ============

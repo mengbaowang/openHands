@@ -315,7 +315,7 @@ def add_model():
             else:
                 # 如果获取失败，使用用户输入的值
                 initial_capital = float(data.get('initial_capital', 10000))
-                print(f"[WARN] OKX 余额获取失败，使用用户输入值: {initial_capital}")
+                print(f"[ERROR] OKX 余额获取失败，使用用户输入值: {initial_capital}")
         except Exception as e:
             print(f"[ERROR] 获取 OKX 余额失败: {e}")
             initial_capital = float(data.get('initial_capital', 10000))
@@ -1034,7 +1034,7 @@ def get_performance_chart():
                 if btc_historical and len(btc_historical) > 0:
                     btc_historical_data = btc_historical
                 else:
-                    print('[WARN] 无法获取BTC历史数据，无法计算BTC基准线收益')
+                    print('[ERROR] 无法获取BTC历史数据，无法计算BTC基准线收益')
             except Exception as e:
                 print(f'[ERROR] 获取BTC历史数据失败，异常信息: {e}')
 
@@ -1056,7 +1056,7 @@ def get_performance_chart():
                     filtered_btc_data.append(hist_point)
 
             if not filtered_btc_data:
-                print(f'[WARN] 无法获取在 {start_time_utc_str} 之后的BTC历史数据')
+                print(f'[ERROR] 无法获取在 {start_time_utc_str} 之后的BTC历史数据')
             else:
                 # 使用过滤后的最早价格作为初始价格
                 btc_initial_price = filtered_btc_data[0]['price']
@@ -1096,7 +1096,7 @@ def get_performance_chart():
                     'data': btc_baseline_data
                 })
         else:
-            print('[WARN] 无法获取BTC历史数据，无法计算BTC基准线收益')
+            print('[ERROR] 无法获取BTC历史数据，无法计算BTC基准线收益')
 
         conn.close()
 
@@ -1288,7 +1288,7 @@ def trading_loop():
                                     print(f"  [TRADE] {coin}: {msg}")
                     else:
                         error = result.get('error', 'Unknown error')
-                        print(f"[WARN] 模型 {model_id} 执行失败: {error}")
+                        print(f"[ERROR] 模型 {model_id} 执行失败: {error}")
                         
                 except Exception as e:
                     print(f"[ERROR] 模型 {model_id} 异常: {e}")
@@ -1316,7 +1316,7 @@ def init_trading_engines():
         models = db.get_all_models()
 
         if not models:
-            print("[WARN] 未找到交易模型")
+            print("[ERROR] 未找到交易模型")
             return
 
         print(f"\n[INIT] 初始化交易引擎...")

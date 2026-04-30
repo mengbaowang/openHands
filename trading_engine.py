@@ -24,6 +24,14 @@ if config.TRADING_MODE == 'okx_demo':
 
 
 class TradingEngine:
+    MAX_QUANTITY_BY_COIN = {
+        'BTC': 10,
+        'ETH': 500,
+        'SOL': 50000,
+        'BNB': 5000,
+        'XRP': 5000000,
+        'DOGE': 50000000,
+    }
     DEFAULT_STOP_LOSS_PCT = 0.03
     DEFAULT_TAKE_PROFIT_PCT = 0.06
     OKX_TRAILING_STEPS = [
@@ -141,8 +149,9 @@ class TradingEngine:
             raise ValueError(f"Invalid quantity type: {type(quantity)}")
         if quantity <= 0:
             raise ValueError(f"Quantity must be positive, got {quantity}")
-        if quantity > 1000:  # 防止异常大的数量
-            raise ValueError(f"Quantity too large: {quantity}")
+        max_quantity = self.MAX_QUANTITY_BY_COIN.get(coin, 1000000)
+        if quantity > max_quantity:
+            raise ValueError(f"Quantity too large for {coin}: {quantity} > {max_quantity}")
 
     def _validate_leverage(self, leverage: int) -> None:
         """验证杠杆倍数"""
@@ -236,7 +245,7 @@ class TradingEngine:
         """从 OKX 获取真实持仓"""
         balance = self.okx_trader.get_balance()
         if 'error' in balance:
-            print(f"[WARN] 模型 {self.model_id} 获取余额失败: {balance['error']}")
+            print(f"[ERROR] 模型 {self.model_id} 获取余额失败: {balance['error']}")
             balance = {'total': 10000, 'available': 10000, 'frozen': 0, 'details': []}
         
         details = balance.get('details', [])

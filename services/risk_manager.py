@@ -1,7 +1,4 @@
-"""
-风险管理器
-实现风险评分、仓位管理、最大回撤监控
-"""
+"""风险评分、持仓预警与回撤监控模块。"""
 from typing import Dict, List
 import config
 

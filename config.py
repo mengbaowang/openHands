@@ -1,8 +1,4 @@
-"""
-AI交易器 - 统一配置管理
-遵循DRY和OCP原则，所有配置集中管理
-使用 .env 文件管理环境变量，避免配置混乱
-"""
+"""集中管理运行时、交易和交易所相关配置。"""
 import os
 from dotenv import load_dotenv
 
@@ -53,8 +49,8 @@ OKX_SYMBOLS = {
     'DOGE': 'DOGE-USDT-SWAP'
 }
 
-# 交易模式切换 simulation(模拟交易） | okx_demo(OKX模拟盘）
-TRADING_MODE = os.getenv('TRADING_MODE', 'simulation')
+# 交易模式切换: okx_demo(OKX模拟盘) | okx_live(OKX实盘)
+TRADING_MODE = os.getenv('TRADING_MODE', 'okx_demo')
 # ============ 市场数据配置 ============
 MARKET_API_CACHE_DURATION = 5  # 秒
 BINANCE_API_URL = 'https://api.binance.com/api/v3'
@@ -66,7 +62,7 @@ OKX_API_URL = 'https://www.okx.com/api/v5'
 OKX_API_KEY = os.getenv('OKX_API_KEY', '83a3f1d1-e6f4-4f48-abe4-eec5b8f91c54')
 OKX_API_SECRET = os.getenv('OKX_API_SECRET', '4C4D384D0692A86ECA60F8EC01A47FB3')
 OKX_PASSPHRASE = os.getenv('OKX_PASSPHRASE', 'Mengbaowang666.')
-OKX_FLAG = '1'  # 1=模拟盘, 0=实盘
+OKX_FLAG = '1' if TRADING_MODE == 'okx_demo' else '0'  # 1=模拟盘, 0=实盘
 # ============ 前端刷新频率 ============
 MARKET_REFRESH_INTERVAL = 5000  # 毫秒（修复了原来的错误35008）
 PORTFOLIO_REFRESH_INTERVAL = 10000  # 毫秒

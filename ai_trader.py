@@ -1,3 +1,4 @@
+"""负责组装 LLM 提示词、解析响应并发起交易决策请求。"""
 import json
 from typing import Dict
 from openai import OpenAI, APIConnectionError, APIError
@@ -55,9 +56,26 @@ MARKET DATA:
 """
         for coin, data in market_state.items():
             prompt += f"{coin}: ${data['price']:.2f} ({data['change_24h']:+.2f}%)\n"
-            if 'indicators' in data and data['indicators']:
-                indicators = data['indicators']
-                prompt += f"  SMA7: ${indicators.get('sma_7', 0):.2f}, SMA14: ${indicators.get('sma_14', 0):.2f}, RSI: {indicators.get('rsi_14', 0):.1f}\n"
+            timeframes = data.get('timeframes', {})
+            for timeframe in ('1h', '15m', '5m'):
+                indicators = timeframes.get(timeframe) or {}
+                if not indicators:
+                    continue
+                prompt += (
+                    f"  {timeframe.upper()}: "
+                    f"close=${indicators.get('current_price', 0):.2f}, "
+                    f"SMA5=${indicators.get('sma_5', 0):.2f}, "
+                    f"SMA7=${indicators.get('sma_7', 0):.2f}, "
+                    f"SMA14=${indicators.get('sma_14', 0):.2f}, "
+                    f"RSI={indicators.get('rsi_14', 0):.1f}, "
+                    f"MACD={indicators.get('macd', 0):.4f}, "
+                    f"MACD_hist={indicators.get('macd_histogram', 0):.4f}, "
+                    f"ATR={indicators.get('atr_14', 0):.2f}, "
+                    f"VolRatio={indicators.get('volume_ratio', 0):.2f}, "
+                    f"High20=${indicators.get('recent_high_20', 0):.2f}, "
+                    f"Low20=${indicators.get('recent_low_20', 0):.2f}, "
+                    f"MACD_hist_tail={indicators.get('macd_histogram_tail', [])}\n"
+                )
         
         prompt += f"""
 ACCOUNT STATUS:
@@ -70,16 +88,29 @@ CURRENT POSITIONS:
 """
         if portfolio['positions']:
             for pos in portfolio['positions']:
-                prompt += f"- {pos['coin']} {pos['side']}: {pos['quantity']:.4f} @ ${pos['avg_price']:.2f} ({pos['leverage']}x)\n"
+                prompt += (
+                    f"- {pos['coin']} {pos['side']}: {pos['quantity']:.4f} @ ${pos['avg_price']:.2f} ({pos['leverage']}x), "
+                    f"current=${pos.get('current_price', 0) or 0:.2f}, "
+                    f"net_profit={float(pos.get('last_profit_pct') or 0) * 100:.2f}%, "
+                    f"peak_net_profit={float(pos.get('peak_profit_pct') or 0) * 100:.2f}%, "
+                    f"peak_price=${float(pos.get('peak_price') or pos['avg_price']):.2f}, "
+                    f"stop_loss=${float(pos.get('stop_loss') or 0):.2f}, "
+                    f"take_profit=${float(pos.get('take_profit') or 0):.2f}\n"
+                )
         else:
             prompt += "None\n"
 
         prompt += """
+EXECUTION RULES YOU MUST RESPECT:
+- The engine already enforces hard stop-losses and a mandatory full close when net floating profit retraces 20% from the position's peak net floating profit after peak profit reaches at least 3%.
+- Do not assume missing data. If 1H/15M/5M alignment or RR cannot be justified from the supplied data, prefer `hold`.
+- Use the supplied net profit percentages as the source of truth for position profit state.
+
 OUTPUT FORMAT (JSON only):
 ```json
 {
   "COIN": {
-   "signal": "buy_to_enter|sell_to_enter|sell_to_close|buy_to_close|hold",
+   "signal": "buy_to_enter|sell_to_enter|sell_to_close|buy_to_close|reduce_position|increase_position|hold",
    "quantity": 0.5,
     "leverage": 10,
     "profit_target": 45000.0,
@@ -305,21 +336,13 @@ Provide detailed reasoning for each decision. Analyze and output JSON only.
 
     def _get_default_prompt(self) -> str:
         """返回默认的交易策略prompt"""
-        return """You are a professional cryptocurrency trader. Analyze the market and make trading decisions.
+        return """You are a professional cryptocurrency trader.
 
-TRADING RULES:
-1. Signals: buy_to_enter (long), sell_to_enter (short), close_position, hold
-2. Risk Management:
-   - Max 3 positions
-   - Risk 1-5% per trade
-   - Use appropriate leverage (1-20x)
-3. Position Sizing:
-   - Conservative: 1-2% risk
-   - Moderate: 2-4% risk
-   - Aggressive: 4-5% risk
-4. Exit Strategy:
-   - Close losing positions quickly
-   - Let winners run
-   - Use technical indicators
+Trading rules:
+- Only open positions when 1H and 15M align, and use 5M only for entry confirmation.
+- Respect net-profit economics after fees. If expected net profit is too small or RR is unclear, hold.
+- Prefer high-quality signals with RSI, MACD, ATR, structure, and volume agreement.
+- Use `reduce_position` or `increase_position` only when the supplied state clearly supports it.
+- Hard exits such as stop-losses and peak-profit retracement are enforced by the engine; do not fight them.
 
-Provide detailed reasoning for each decision. Analyze and output JSON only."""
+Return JSON only."""

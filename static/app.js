@@ -1,3 +1,4 @@
+/* 仪表盘前端逻辑：模型管理、图表、持仓和交易展示。 */
 class TradingApp {
     constructor() {
         this.currentModelId = null;

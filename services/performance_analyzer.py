@@ -1,7 +1,4 @@
-"""
-绩效分析器
-计算各种交易绩效指标
-"""
+"""交易模型的绩效分析与报表生成模块。"""
 from typing import Dict, List
 from datetime import datetime, timedelta
 

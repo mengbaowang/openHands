@@ -1,6 +1,4 @@
-"""
-OKX 模拟盘交易模块
-"""
+"""OKX API 封装，负责余额、持仓、下单以及原生止盈止损管理。"""
 from okx import Account, Trade, MarketData
 import config
 import time

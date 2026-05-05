@@ -1,3 +1,4 @@
+"""Flask Web 应用入口，负责认证、模型管理、仪表盘和交易 API。"""
 from flask import Flask, render_template, request, jsonify, session
 from flask_cors import CORS
 import time
@@ -296,37 +297,26 @@ def get_model(model_id):
 @app.route('/api/models', methods=['POST'])
 @login_required
 def add_model():
-
-
-    # 根据 TRADING_MODE 决定初始资金
-    if config.TRADING_MODE == 'okx_demo':
-        # OKX 模式：从 OKX API 获取初始余额
-        try:
-            from okx_trader import OKXTrader
-            okx_trader = OKXTrader()
-            balance_data = okx_trader.get_balance()
-            if balance_data and 'error' not in balance_data:
-                # 计算所有币种的总价值
-                balances = balance_data.get('balances', {})
-                initial_capital = 0.0
-                for ccy, bal in balances.items():
-                    initial_capital += bal.get('total', 0)
-                print(f"[INFO] OKX 模式：使用 OKX 余额作为初始资金: {initial_capital}")
-            else:
-                # 如果获取失败，使用用户输入的值
-                initial_capital = float(data.get('initial_capital', 10000))
-                print(f"[ERROR] OKX 余额获取失败，使用用户输入值: {initial_capital}")
-        except Exception as e:
-            print(f"[ERROR] 获取 OKX 余额失败: {e}")
+    data = request.json
+    try:
+        from services.exchanges.okx_adapter import OKXTrader
+        okx_trader = OKXTrader()
+        balance_data = okx_trader.get_balance()
+        if balance_data and 'error' not in balance_data:
+            balances = balance_data.get('balances', {})
+            initial_capital = 0.0
+            for _, bal in balances.items():
+                initial_capital += bal.get('total', 0)
+            print(f"[INFO] OKX 模式：使用 OKX 余额作为初始资金: {initial_capital}")
+        else:
             initial_capital = float(data.get('initial_capital', 10000))
-    else:
-        # 模拟模式：使用用户输入的初始资金
+            print(f"[WARN] OKX 余额获取失败，使用提交值: {initial_capital}")
+    except Exception as e:
+        print(f"[ERROR] 获取 OKX 余额失败: {e}")
         initial_capital = float(data.get('initial_capital', 10000))
-
 
     """创建新模型（需要登录）"""
     user_id = get_current_user_id()
-    data = request.json
     model_id = db.add_model(
         user_id=user_id,
         name=data['name'],

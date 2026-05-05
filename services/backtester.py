@@ -1,7 +1,4 @@
-"""
-回测系统
-用历史数据测试AI交易策略的表现
-"""
+"""历史回测工具，用于验证交易策略表现。"""
 from typing import Dict, List
 from datetime import datetime, timedelta
 import config

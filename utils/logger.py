@@ -1,6 +1,4 @@
-"""
-Unified logging helpers.
-"""
+"""运行时日志工具，支持按日滚动输出。"""
 import logging
 import sys
 import threading

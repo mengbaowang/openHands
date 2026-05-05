@@ -1,6 +1,4 @@
-"""
-时区工具模块 - 数据库存UTC，展示用东八区（UTC+8）
-"""
+"""UTC 与北京时间转换辅助函数。"""
 from datetime import datetime, timedelta
 
 # 东八区偏移量

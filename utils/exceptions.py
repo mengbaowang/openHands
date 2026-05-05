@@ -1,7 +1,4 @@
-"""
-自定义异常类
-统一错误处理策略
-"""
+"""项目自定义异常类型。"""
 
 class TradingBotException(Exception):
     """交易机器人基础异常"""

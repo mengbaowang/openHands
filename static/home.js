@@ -1,3 +1,4 @@
+/* 主页大屏逻辑：实时价格、收益图表和行情滚动。 */
 // AI Trading Platform - Home Page
 class TradingDashboard {
     constructor() {

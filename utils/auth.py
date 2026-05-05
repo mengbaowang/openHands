@@ -1,7 +1,4 @@
-"""
-用户认证工具
-密码加密、Session管理、权限验证
-"""
+"""基于 Session 的认证辅助函数与密码工具。"""
 from functools import wraps
 from flask import session, jsonify, request
 from werkzeug.security import generate_password_hash, check_password_hash

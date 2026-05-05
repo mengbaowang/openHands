@@ -1,6 +1,4 @@
-"""
-Database management module
-"""
+"""SQLite 持久化层，负责用户、模型、交易、持仓、对话和账户历史。"""
 import sqlite3
 import json
 import config
@@ -23,7 +21,7 @@ class Database:
         if self._okx_trader is not None:
             return self._okx_trader
 
-        from okx_trader import OKXTrader
+        from services.exchanges.okx_adapter import OKXTrader
         self._okx_trader = OKXTrader()
         return self._okx_trader
     
@@ -87,6 +85,9 @@ class Database:
                 okx_risk_algo_id TEXT,
                 okx_risk_algo_cl_ord_id TEXT,
                 trailing_tier REAL DEFAULT 0,
+                peak_price REAL,
+                peak_profit_pct REAL DEFAULT 0,
+                last_profit_pct REAL DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (model_id) REFERENCES models(id),
                 UNIQUE(model_id, coin, side)
@@ -121,6 +122,21 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE portfolios ADD COLUMN trailing_tier REAL DEFAULT 0')
+        except:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN peak_price REAL')
+        except:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN peak_profit_pct REAL DEFAULT 0')
+        except:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN last_profit_pct REAL DEFAULT 0')
         except:
             pass
         
@@ -237,16 +253,22 @@ class Database:
                        avg_price: float, leverage: int = 1, side: str = 'long',
                        stop_loss: float = None, take_profit: float = None,
                        entry_ord_id: str = None, okx_risk_algo_id: str = None,
-                       okx_risk_algo_cl_ord_id: str = None, trailing_tier: float = 0):
+                       okx_risk_algo_cl_ord_id: str = None, trailing_tier: float = 0,
+                       peak_price: float = None, peak_profit_pct: float = None,
+                       last_profit_pct: float = None):
         """Update position with stop loss and take profit"""
         conn = self.get_connection()
         cursor = conn.cursor()
+        effective_peak_price = avg_price if peak_price is None else peak_price
+        effective_peak_profit_pct = 0 if peak_profit_pct is None else peak_profit_pct
+        effective_last_profit_pct = 0 if last_profit_pct is None else last_profit_pct
         cursor.execute('''
             INSERT INTO portfolios (
                 model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
-                entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier, updated_at
+                entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
+                peak_price, peak_profit_pct, last_profit_pct, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(model_id, coin, side) DO UPDATE SET
                 quantity = excluded.quantity,
                 avg_price = excluded.avg_price,
@@ -257,10 +279,14 @@ class Database:
                 okx_risk_algo_id = excluded.okx_risk_algo_id,
                 okx_risk_algo_cl_ord_id = excluded.okx_risk_algo_cl_ord_id,
                 trailing_tier = excluded.trailing_tier,
+                peak_price = excluded.peak_price,
+                peak_profit_pct = excluded.peak_profit_pct,
+                last_profit_pct = excluded.last_profit_pct,
                 updated_at = CURRENT_TIMESTAMP
         ''', (
             model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
-            entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier
+            entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
+            effective_peak_price, effective_peak_profit_pct, effective_last_profit_pct
         ))
         conn.commit()
         conn.close()
@@ -269,13 +295,16 @@ class Database:
                               price: float, leverage: int = 1, side: str = 'long',
                               stop_loss: float = None, take_profit: float = None,
                               entry_ord_id: str = None, okx_risk_algo_id: str = None,
-                              okx_risk_algo_cl_ord_id: str = None, trailing_tier: float = None) -> Dict:
+                              okx_risk_algo_cl_ord_id: str = None, trailing_tier: float = None,
+                              peak_price: float = None, peak_profit_pct: float = None,
+                              last_profit_pct: float = None) -> Dict:
         """Apply a quantity delta and keep a weighted average entry price."""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             SELECT quantity, avg_price, leverage, stop_loss, take_profit, entry_ord_id,
-                   okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier
+                   okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
+                   peak_price, peak_profit_pct, last_profit_pct
             FROM portfolios
             WHERE model_id = ? AND coin = ? AND side = ?
         ''', (model_id, coin, side))
@@ -302,7 +331,10 @@ class Database:
                     'entry_ord_id': entry_ord_id,
                     'okx_risk_algo_id': okx_risk_algo_id,
                     'okx_risk_algo_cl_ord_id': okx_risk_algo_cl_ord_id,
-                    'trailing_tier': trailing_tier if trailing_tier is not None else 0
+                    'trailing_tier': trailing_tier if trailing_tier is not None else 0,
+                    'peak_price': peak_price if peak_price is not None else price,
+                    'peak_profit_pct': peak_profit_pct if peak_profit_pct is not None else 0,
+                    'last_profit_pct': last_profit_pct if last_profit_pct is not None else 0
                 }
 
             weighted_avg_price = (
@@ -312,6 +344,7 @@ class Database:
                 UPDATE portfolios
                 SET quantity = ?, avg_price = ?, leverage = ?, stop_loss = ?, take_profit = ?,
                     entry_ord_id = ?, okx_risk_algo_id = ?, okx_risk_algo_cl_ord_id = ?, trailing_tier = ?,
+                    peak_price = ?, peak_profit_pct = ?, last_profit_pct = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE model_id = ? AND coin = ? AND side = ?
             ''', (
@@ -324,6 +357,9 @@ class Database:
                 okx_risk_algo_id if okx_risk_algo_id is not None else existing['okx_risk_algo_id'],
                 okx_risk_algo_cl_ord_id if okx_risk_algo_cl_ord_id is not None else existing['okx_risk_algo_cl_ord_id'],
                 trailing_tier if trailing_tier is not None else existing['trailing_tier'],
+                peak_price if peak_price is not None else existing['peak_price'],
+                peak_profit_pct if peak_profit_pct is not None else existing['peak_profit_pct'],
+                last_profit_pct if last_profit_pct is not None else existing['last_profit_pct'],
                 model_id,
                 coin,
                 side
@@ -339,18 +375,25 @@ class Database:
                 'entry_ord_id': entry_ord_id if entry_ord_id is not None else existing['entry_ord_id'],
                 'okx_risk_algo_id': okx_risk_algo_id if okx_risk_algo_id is not None else existing['okx_risk_algo_id'],
                 'okx_risk_algo_cl_ord_id': okx_risk_algo_cl_ord_id if okx_risk_algo_cl_ord_id is not None else existing['okx_risk_algo_cl_ord_id'],
-                'trailing_tier': trailing_tier if trailing_tier is not None else existing['trailing_tier']
+                'trailing_tier': trailing_tier if trailing_tier is not None else existing['trailing_tier'],
+                'peak_price': peak_price if peak_price is not None else existing['peak_price'],
+                'peak_profit_pct': peak_profit_pct if peak_profit_pct is not None else existing['peak_profit_pct'],
+                'last_profit_pct': last_profit_pct if last_profit_pct is not None else existing['last_profit_pct']
             }
 
         cursor.execute('''
             INSERT INTO portfolios (
                 model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
-                entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier, updated_at
+                entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
+                peak_price, peak_profit_pct, last_profit_pct, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ''', (
             model_id, coin, float(quantity_delta), float(price), leverage, side, stop_loss, take_profit,
-            entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier if trailing_tier is not None else 0
+            entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier if trailing_tier is not None else 0,
+            peak_price if peak_price is not None else float(price),
+            peak_profit_pct if peak_profit_pct is not None else 0,
+            last_profit_pct if last_profit_pct is not None else 0
         ))
         conn.commit()
         conn.close()
@@ -363,7 +406,10 @@ class Database:
             'entry_ord_id': entry_ord_id,
             'okx_risk_algo_id': okx_risk_algo_id,
             'okx_risk_algo_cl_ord_id': okx_risk_algo_cl_ord_id,
-            'trailing_tier': trailing_tier if trailing_tier is not None else 0
+            'trailing_tier': trailing_tier if trailing_tier is not None else 0,
+            'peak_price': peak_price if peak_price is not None else float(price),
+            'peak_profit_pct': peak_profit_pct if peak_profit_pct is not None else 0,
+            'last_profit_pct': last_profit_pct if last_profit_pct is not None else 0
         }
 
     def reduce_position(self, model_id: int, coin: str, quantity_delta: float, side: str = 'long') -> Optional[Dict]:
@@ -372,7 +418,8 @@ class Database:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT quantity, avg_price, leverage, stop_loss, take_profit, entry_ord_id,
-                   okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier
+                   okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
+                   peak_price, peak_profit_pct, last_profit_pct
             FROM portfolios
             WHERE model_id = ? AND coin = ? AND side = ?
         ''', (model_id, coin, side))
@@ -400,7 +447,10 @@ class Database:
                 'entry_ord_id': existing['entry_ord_id'],
                 'okx_risk_algo_id': existing['okx_risk_algo_id'],
                 'okx_risk_algo_cl_ord_id': existing['okx_risk_algo_cl_ord_id'],
-                'trailing_tier': existing['trailing_tier']
+                'trailing_tier': existing['trailing_tier'],
+                'peak_price': existing['peak_price'],
+                'peak_profit_pct': existing['peak_profit_pct'],
+                'last_profit_pct': existing['last_profit_pct']
             }
 
         cursor.execute('''
@@ -419,7 +469,10 @@ class Database:
             'entry_ord_id': existing['entry_ord_id'],
             'okx_risk_algo_id': existing['okx_risk_algo_id'],
             'okx_risk_algo_cl_ord_id': existing['okx_risk_algo_cl_ord_id'],
-            'trailing_tier': existing['trailing_tier']
+            'trailing_tier': existing['trailing_tier'],
+            'peak_price': existing['peak_price'],
+            'peak_profit_pct': existing['peak_profit_pct'],
+            'last_profit_pct': existing['last_profit_pct']
         }
     
     
@@ -554,123 +607,23 @@ class Database:
         return [dict(row) for row in rows]
 
 
-    # ============ OKX Portfolio Management ============
     def get_portfolio(self, model_id: int, current_prices: Dict = None) -> Dict:
-        """
-        Get portfolio with positions and P&L
-        根据 TRADING_MODE 决定从哪里获取数据
-        Args:
-            model_id: Model ID
-            current_prices: Current market prices {coin: price} for unrealized P&L calculation
-        Returns:
-            dict: Portfolio information
-        """
-        # 根据 TRADING_MODE 决定从哪里获取数据
-        if config.TRADING_MODE == 'okx_demo':
-            # OKX 模式：从 OKX API 获取
-            return self._get_portfolio_from_okx(model_id, current_prices)
-        else:
-            # 模拟模式：从本地数据库获取
-            return self._get_portfolio_from_local(model_id, current_prices)
-
-    def _get_portfolio_from_local(self, model_id: int, current_prices: Dict = None) -> Dict:
-        """
-        从本地数据库获取投资组合（模拟模式）
-        Args:
-            model_id: Model ID
-            current_prices: Current market prices
-        Returns:
-            dict: Portfolio information
-        """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # Get positions
-        cursor.execute('''
-            SELECT * FROM portfolios WHERE model_id = ? AND quantity > 0
-        ''', (model_id,))
-        positions = [dict(row) for row in cursor.fetchall()]
-        
-        # Get initial capital
-        cursor.execute('SELECT initial_capital FROM models WHERE id = ?', (model_id,))
-        initial_capital = cursor.fetchone()['initial_capital']
-        
-        # Calculate realized P&L (sum of all trade P&L)
-        cursor.execute('''
-            SELECT COALESCE(SUM(pnl), 0) as total_pnl FROM trades WHERE model_id = ?
-        ''', (model_id,))
-        realized_pnl = cursor.fetchone()['total_pnl']
-        
-        # Calculate margin used
-        margin_used = sum([p['quantity'] * p['avg_price'] / p['leverage'] for p in positions])
-        
-        # Calculate unrealized P&L (if prices provided)
-        unrealized_pnl = 0
-        if current_prices:
-            for pos in positions:
-                coin = pos['coin']
-                if coin in current_prices:
-                    current_price = current_prices[coin]
-                    entry_price = pos['avg_price']
-                    quantity = pos['quantity']
-                    
-                    # Add current price to position
-                    pos['current_price'] = current_price
-                    
-                    # Calculate position P&L
-                    if pos['side'] == 'long':
-                        pos_pnl = (current_price - entry_price) * quantity * pos['leverage']
-                    else:  # short
-                        pos_pnl = (entry_price - current_price) * quantity * pos['leverage']
-                    pos['pnl'] = pos_pnl
-                    unrealized_pnl += pos_pnl
-                else:
-                    pos['current_price'] = None
-                    pos['pnl'] = 0
-        else:
-            for pos in positions:
-                pos['current_price'] = None
-                pos['pnl'] = 0
-        
-        # Cash = initial capital + realized P&L - margin used
-        cash = initial_capital + realized_pnl - margin_used
-        
-        # Position value = quantity * entry price (not margin!)
-        positions_value = sum([p['quantity'] * p['avg_price'] for p in positions])
-        
-        # Total account value = initial capital + realized P&L + unrealized P&L
-        total_value = initial_capital + realized_pnl + unrealized_pnl
-        
-        conn.close()
-        
-        return {
-            'model_id': model_id,
-            'cash': cash,
-            'positions': positions,
-            'positions_value': positions_value,
-            'margin_used': margin_used,
-            'total_value': total_value,
-            'realized_pnl': realized_pnl,
-            'unrealized_pnl': unrealized_pnl
-        }
-
-    def _get_portfolio_from_okx(self, model_id: int, current_prices: Dict = None) -> Dict:
-        """从 OKX API 获取投资组合（OKX 模式）"""
+        """从 OKX API 获取投资组合。"""
         try:
             okx_trader = self.get_okx_trader()
         except ImportError:
-            print("[ERROR] okx_trader 导入失败，降级到本地数据库")
-            return self._get_portfolio_from_local(model_id, current_prices)
+            print("[ERROR] okx_trader 导入失败")
+            return {'cash': 0, 'positions': [], 'total_value': 0, 'positions_value': 0, 'realized_pnl': 0, 'unrealized_pnl': 0, 'frozen_margin': 0, 'wallet_balances': {}}
         except Exception as e:
-            print(f"[ERROR] OKXTrader 初始化失败：{e}，降级到本地数据库")
-            return self._get_portfolio_from_local(model_id, current_prices)
+            print(f"[ERROR] OKXTrader 初始化失败：{e}")
+            return {'cash': 0, 'positions': [], 'total_value': 0, 'positions_value': 0, 'realized_pnl': 0, 'unrealized_pnl': 0, 'frozen_margin': 0, 'wallet_balances': {}}
         
         try:
             # 获取账户余额
             balance_data = okx_trader.get_balance()
             if not balance_data or 'error' in balance_data:
                 print(f"[WARN] OKX 账户余额获取失败: {balance_data.get('error', '未知错误')}")
-                return self._get_portfolio_from_local(model_id, current_prices)
+                return {'cash': 0, 'positions': [], 'total_value': 0, 'positions_value': 0, 'realized_pnl': 0, 'unrealized_pnl': 0, 'frozen_margin': 0, 'wallet_balances': {}}
             
             details = balance_data.get('details', [])
             
@@ -746,6 +699,9 @@ class Database:
                         'pnl': pos_pnl,
                         'stop_loss': db_pos.get('stop_loss') if db_pos else None,
                         'take_profit': db_pos.get('take_profit') if db_pos else None,
+                        'peak_price': db_pos.get('peak_price') if db_pos else None,
+                        'peak_profit_pct': db_pos.get('peak_profit_pct') if db_pos else 0,
+                        'last_profit_pct': db_pos.get('last_profit_pct') if db_pos else 0,
                         'value': position_value
                     })
             
@@ -764,8 +720,7 @@ class Database:
             print(f"[ERROR] 获取 OKX 投资组合失败：{e}")
             import traceback
             traceback.print_exc()
-            print(f"[WARN] 降级到本地数据库获取投资组合")
-            return self._get_portfolio_from_local(model_id, current_prices)
+            return {'cash': 0, 'positions': [], 'total_value': 0, 'positions_value': 0, 'realized_pnl': 0, 'unrealized_pnl': 0, 'frozen_margin': 0, 'wallet_balances': {}}
 
     # ============ Position Management ============
     def get_position(self, model_id: int, coin: str, side: str) -> Optional[Dict]:
@@ -774,7 +729,8 @@ class Database:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT stop_loss, take_profit, entry_ord_id, okx_risk_algo_id,
-                   okx_risk_algo_cl_ord_id, trailing_tier
+                   okx_risk_algo_cl_ord_id, trailing_tier,
+                   peak_price, peak_profit_pct, last_profit_pct
             FROM portfolios
             WHERE model_id = ? AND coin = ? AND side = ?
         ''', (model_id, coin, side))

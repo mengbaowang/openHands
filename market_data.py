@@ -1,8 +1,4 @@
-"""
-Market data module - Multi-source API integration with fallback
-支持多数据源：Binance -> CoinGecko -> CoinCap -> CryptoCompare
-增强缓存机制：内存缓存 + 文件持久化缓存
-"""
+"""行情获取、缓存管理与技术指标计算模块。"""
 import requests
 import time
 import json
@@ -12,6 +8,14 @@ import config
 
 class MarketDataFetcher:
     """Fetch real-time market data from multiple sources with fallback"""
+
+    TIMEFRAME_CONFIG = {
+        '5m': {'binance': '5m', 'coincap': 'm5', 'cache_seconds': 300, 'points': 120},
+        '15m': {'binance': '15m', 'coincap': 'm15', 'cache_seconds': 900, 'points': 120},
+        '1h': {'binance': '1h', 'coincap': 'h1', 'cache_seconds': 3600, 'points': 240},
+        '4h': {'binance': '4h', 'coincap': 'h6', 'cache_seconds': 14400, 'points': 180},
+        '1d': {'binance': '1d', 'coincap': 'd1', 'cache_seconds': 21600, 'points': 90},
+    }
 
     def __init__(self):
         # API URLs
@@ -109,9 +113,9 @@ class MarketDataFetcher:
             if time.time() - self._cache_time[cache_key] < self._cache_duration:
                 return self._cache[cache_key]
 
-        # 1. 优先使用 OKX（如果启用）
+        # 1. 优先使用 OKX 价格源
         prices = None
-        if config.TRADING_MODE == 'okx_demo':
+        if config.TRADING_MODE in {'okx_demo', 'okx_live'}:
             prices = self._get_prices_from_okx(coins)
             if prices and len(prices) == len(coins):
                 self._cache[cache_key] = prices
@@ -408,6 +412,43 @@ class MarketDataFetcher:
         print(f"[ERROR] All APIs failed and no cached data available. Please check network connection.")
         return []  # 返回空列表，让调用方处理
 
+    def get_historical_candles(self, coin: str, timeframe: str = '1h', limit: int = None) -> List[Dict]:
+        """Get OHLCV candles for a specific timeframe with caching and API fallback."""
+        tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
+        if not tf_config:
+            raise ValueError(f'Unsupported timeframe: {timeframe}')
+
+        candle_limit = limit or tf_config['points']
+        cache_key = f'candles_{coin}_{timeframe}_{candle_limit}'
+        cache_ttl = tf_config['cache_seconds']
+        if cache_key in self._cache:
+            cache_age = time.time() - self._cache_time[cache_key]
+            if cache_age < cache_ttl:
+                return self._cache[cache_key]
+
+        candles = self._get_candles_from_binance(coin, timeframe, candle_limit)
+        if candles:
+            self._cache[cache_key] = candles
+            self._cache_time[cache_key] = time.time()
+            self._save_persistent_cache()
+            return candles
+
+        candles = self._get_candles_from_coincap(coin, timeframe, candle_limit)
+        if candles:
+            self._cache[cache_key] = candles
+            self._cache_time[cache_key] = time.time()
+            self._save_persistent_cache()
+            return candles
+
+        if cache_key in self._cache:
+            cache_age = time.time() - self._cache_time[cache_key]
+            if cache_age < 2592000:
+                print(f"[WARN] Candle API failed, using cached real data for {coin} {timeframe} ({cache_age/3600:.1f} hours old)")
+                return self._cache[cache_key]
+
+        print(f"[ERROR] Failed to get candles for {coin} {timeframe} - NO MOCK DATA ALLOWED!")
+        return []
+
     def _get_historical_from_binance(self, coin: str, days: int) -> Optional[List[Dict]]:
         """Fetch historical prices from Binance (最稳定的数据源)"""
         try:
@@ -445,6 +486,45 @@ class MarketDataFetcher:
 
         except Exception as e:
             print(f"[WARN] Binance historical data failed for {coin}: {e}")
+            return None
+
+    def _get_candles_from_binance(self, coin: str, timeframe: str, limit: int) -> Optional[List[Dict]]:
+        """Fetch OHLCV candles from Binance."""
+        try:
+            symbol = self.binance_symbols.get(coin)
+            if not symbol:
+                return None
+
+            tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
+            if not tf_config:
+                return None
+
+            response = requests.get(
+                f"{self.binance_base_url}/klines",
+                params={
+                    'symbol': symbol,
+                    'interval': tf_config['binance'],
+                    'limit': limit
+                },
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            candles = []
+            for kline in data:
+                candles.append({
+                    'timestamp': int(kline[0]),
+                    'open': float(kline[1]),
+                    'high': float(kline[2]),
+                    'low': float(kline[3]),
+                    'close': float(kline[4]),
+                    'price': float(kline[4]),
+                    'volume': float(kline[5]),
+                })
+            return candles if candles else None
+        except Exception as e:
+            print(f"[WARN] Binance candle data failed for {coin} {timeframe}: {e}")
             return None
 
     def _get_historical_from_coingecko(self, coin: str, days: int) -> Optional[List[Dict]]:
@@ -508,11 +588,53 @@ class MarketDataFetcher:
         except Exception as e:
             print(f"[WARN] CoinCap historical data failed for {coin}: {e}")
             return None
+
+    def _get_candles_from_coincap(self, coin: str, timeframe: str, limit: int) -> Optional[List[Dict]]:
+        """Fetch approximate candles from CoinCap history."""
+        try:
+            self._rate_limit('coincap')
+            coin_id = self.coincap_mapping.get(coin, coin.lower())
+            tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
+            if not tf_config:
+                return None
+
+            response = requests.get(
+                f"{self.coincap_base_url}/assets/{coin_id}/history",
+                params={'interval': tf_config['coincap']},
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            candles = []
+            for item in data.get('data', [])[-limit:]:
+                price = float(item['priceUsd'])
+                candles.append({
+                    'timestamp': item['time'],
+                    'open': price,
+                    'high': price,
+                    'low': price,
+                    'close': price,
+                    'price': price,
+                    'volume': float(item.get('volumeUsd24Hr') or 0),
+                })
+            return candles if candles else None
+        except Exception as e:
+            print(f"[WARN] CoinCap candle data failed for {coin} {timeframe}: {e}")
+            return None
     
     def calculate_technical_indicators(self, coin: str) -> Dict:
         """Calculate technical indicators"""
-        historical = self.get_historical_prices(coin, days=30)
-        return self.calculate_technical_indicators_from_history(historical)
+        candles = self.get_historical_candles(coin, timeframe='1h', limit=self.TIMEFRAME_CONFIG['1h']['points'])
+        return self.calculate_technical_indicators_from_history(candles)
+
+    def get_multi_timeframe_indicators(self, coin: str) -> Dict:
+        """Return indicators for the strategy timeframes used by the prompt."""
+        result = {}
+        for timeframe in ('1h', '15m', '5m'):
+            candles = self.get_historical_candles(coin, timeframe=timeframe, limit=self.TIMEFRAME_CONFIG[timeframe]['points'])
+            result[timeframe] = self.calculate_technical_indicators_from_history(candles)
+        return result
 
     def calculate_technical_indicators_from_history(self, historical: List[Dict]) -> Dict:
         """Calculate technical indicators from a provided historical window."""
@@ -520,9 +642,13 @@ class MarketDataFetcher:
         if not historical or len(historical) < 14:
             return {}
 
-        prices = [p['price'] for p in historical]
+        prices = [float(p.get('close', p.get('price', 0))) for p in historical]
+        highs = [float(p.get('high', p.get('close', p.get('price', 0)))) for p in historical]
+        lows = [float(p.get('low', p.get('close', p.get('price', 0)))) for p in historical]
+        volumes = [float(p.get('volume', 0)) for p in historical]
 
         # Simple Moving Average
+        sma_5 = sum(prices[-5:]) / 5 if len(prices) >= 5 else prices[-1]
         sma_7 = sum(prices[-7:]) / 7 if len(prices) >= 7 else prices[-1]
         sma_14 = sum(prices[-14:]) / 14 if len(prices) >= 14 else prices[-1]
         sma_30 = sum(prices[-30:]) / 30 if len(prices) >= 30 else prices[-1]
@@ -533,7 +659,12 @@ class MarketDataFetcher:
 
         # MACD
         macd_line = ema_12 - ema_26
-        signal_line = self._calculate_ema([macd_line] * 9, 9)  # 简化版
+        macd_series = []
+        for idx in range(len(prices)):
+            ema_12_i = self._calculate_ema(prices[:idx + 1], 12)
+            ema_26_i = self._calculate_ema(prices[:idx + 1], 26)
+            macd_series.append(ema_12_i - ema_26_i)
+        signal_line = self._calculate_ema(macd_series, 9)
         macd_histogram = macd_line - signal_line
 
         # RSI
@@ -559,8 +690,16 @@ class MarketDataFetcher:
         # 价格位置（在布林带中的位置）
         bb_position = ((prices[-1] - bb_lower) / (bb_upper - bb_lower)) if (bb_upper - bb_lower) > 0 else 0.5
 
+        atr = self._calculate_atr(highs, lows, prices, 14)
+        avg_volume_20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else sum(volumes) / len(volumes) if volumes else 0
+        recent_volumes = volumes[-3:] if len(volumes) >= 3 else volumes
+        volume_ratio = (volumes[-1] / avg_volume_20) if avg_volume_20 > 0 and volumes else 0
+        recent_high = max(highs[-20:]) if len(highs) >= 20 else max(highs)
+        recent_low = min(lows[-20:]) if len(lows) >= 20 else min(lows)
+
         return {
             'sma_7': sma_7,
+            'sma_5': sma_5,
             'sma_14': sma_14,
             'sma_30': sma_30,
             'ema_12': ema_12,
@@ -575,7 +714,16 @@ class MarketDataFetcher:
             'bb_position': bb_position,
             'current_price': prices[-1],
             'price_change_7d': ((prices[-1] - prices[0]) / prices[0]) * 100 if prices[0] > 0 else 0,
-            'volatility': std_20 / sma_20 if sma_20 > 0 else 0
+            'volatility': std_20 / sma_20 if sma_20 > 0 else 0,
+            'atr_14': atr,
+            'volume': volumes[-1] if volumes else 0,
+            'volume_avg_20': avg_volume_20,
+            'volume_ratio': volume_ratio,
+            'recent_high_20': recent_high,
+            'recent_low_20': recent_low,
+            'close_prices_tail': prices[-5:],
+            'macd_histogram_tail': [value - signal_line for value in (macd_series[-5:] if len(macd_series) >= 5 else macd_series)],
+            'volume_tail': recent_volumes,
         }
 
     def _calculate_ema(self, prices: List[float], period: int) -> float:
@@ -599,3 +747,25 @@ class MarketDataFetcher:
         mean = sum(prices) / len(prices)
         variance = sum((p - mean) ** 2 for p in prices) / len(prices)
         return variance ** 0.5
+
+    def _calculate_atr(self, highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
+        """Calculate ATR from OHLC data."""
+        if not highs or not lows or not closes:
+            return 0
+
+        true_ranges = []
+        for idx in range(1, len(closes)):
+            high = highs[idx]
+            low = lows[idx]
+            prev_close = closes[idx - 1]
+            true_ranges.append(max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close)
+            ))
+
+        if not true_ranges:
+            return 0
+
+        window = true_ranges[-period:] if len(true_ranges) >= period else true_ranges
+        return sum(window) / len(window)

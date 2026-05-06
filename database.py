@@ -485,18 +485,38 @@ class Database:
         ''', (model_id, coin, side))
         conn.commit()
         conn.close()
+
+    def get_open_portfolio_rows(self, model_id: int) -> List[Dict]:
+        """Return all locally tracked open portfolio rows for reconciliation."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM portfolios
+            WHERE model_id = ? AND quantity > 0
+            ORDER BY updated_at DESC
+        ''', (model_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
     
     # ============ Trade Records ============
     
     def add_trade(self, model_id: int, coin: str, signal: str, quantity: float,
-                  price: float, leverage: int = 1, side: str = 'long', pnl: float = 0):
+                  price: float, leverage: int = 1, side: str = 'long', pnl: float = 0,
+                  timestamp: str = None):
         """Add trade record"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO trades (model_id, coin, signal, quantity, price, leverage, side, pnl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (model_id, coin, signal, quantity, price, leverage, side, pnl))
+        if timestamp:
+            cursor.execute('''
+                INSERT INTO trades (model_id, coin, signal, quantity, price, leverage, side, pnl, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (model_id, coin, signal, quantity, price, leverage, side, pnl, timestamp))
+        else:
+            cursor.execute('''
+                INSERT INTO trades (model_id, coin, signal, quantity, price, leverage, side, pnl)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (model_id, coin, signal, quantity, price, leverage, side, pnl))
         conn.commit()
         conn.close()
     

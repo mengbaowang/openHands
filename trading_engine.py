@@ -42,6 +42,10 @@ class TradingEngine:
             self._cycle_logs = []
             market_state = self._get_market_state()
             current_prices = {coin: market_state[coin]['price'] for coin in market_state}
+            current_prices['__timeframes__'] = {
+                coin: market_state[coin].get('timeframes', {})
+                for coin in market_state
+            }
 
             portfolio = self.execution_service.get_portfolio(current_prices)
             stop_results = self.execution_service.check_stop_loss_take_profit(portfolio, current_prices)

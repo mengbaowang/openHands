@@ -492,9 +492,26 @@ class TradingDashboard {
             document.getElementById('tradesCount').textContent = `显示最近${trades.length}条交易`;
 
             container.innerHTML = trades.map(trade => {
-                const actionClass = trade.action === 'buy' ? 'buy' : 'sell';
-                const actionText = trade.action === 'buy' ? '买入' : '卖出';
-                const actionColor = trade.action === 'buy' ? '#22c55e' : '#ef4444';
+                const actionMetaMap = {
+                    'buy_to_enter': { text: '开多', color: '#22c55e', cls: 'buy' },
+                    'sell_to_enter': { text: '开空', color: '#ef4444', cls: 'sell' },
+                    'sell_to_close': { text: '平多', color: '#f59e0b', cls: 'close' },
+                    'buy_to_close': { text: '平空', color: '#f59e0b', cls: 'close' },
+                    'close_position': { text: '平仓', color: '#f59e0b', cls: 'close' },
+                    'reduce_position': { text: '减仓', color: '#06b6d4', cls: 'reduce' },
+                    'increase_position': { text: '加仓', color: '#8b5cf6', cls: 'increase' },
+                    'move_stop_loss': { text: '上移止损', color: '#64748b', cls: 'adjust' },
+                    'auto_close': { text: '自动平仓', color: '#f97316', cls: 'close' },
+                    'hold': { text: '持有', color: '#94a3b8', cls: 'hold' }
+                };
+                const actionMeta = actionMetaMap[trade.action] || {
+                    text: trade.action_text || trade.action || '未知动作',
+                    color: '#94a3b8',
+                    cls: 'other'
+                };
+                const actionClass = actionMeta.cls;
+                const actionText = trade.action_text || actionMeta.text;
+                const actionColor = actionMeta.color;
                 const pnlClass = trade.pnl && trade.pnl >= 0 ? 'positive' : 'negative';
                 const pnlValue = trade.pnl || 0;
 

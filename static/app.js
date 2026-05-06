@@ -476,7 +476,10 @@ class TradingApp {
             'sell_to_close': '平多',
             'buy_to_close': '平空',
             'take_profit': '止盈',
-            'trailing_stop': '移动止损'
+            'trailing_stop': '移动止损',
+            'move_stop_loss': '上移止损',
+            'auto_close': '自动平仓',
+            'hold': '持有'
         };
 
         let trades = [...this.trades];
@@ -493,7 +496,7 @@ class TradingApp {
             trades = trades.filter(trade => {
                 const coin = (trade.coin || '').toLowerCase();
                 const signal = (trade.signal || '').toLowerCase();
-                const signalText = (signalMap[trade.signal] || '').toLowerCase();
+                const signalText = (trade.action_text || signalMap[trade.signal] || '').toLowerCase();
                 return coin.includes(this.tradeFilters.search)
                     || signal.includes(this.tradeFilters.search)
                     || signalText.includes(this.tradeFilters.search);
@@ -533,9 +536,16 @@ class TradingApp {
                 'reduce_position': { badge: 'badge-reduce', text: '减仓' },
                 'increase_position': { badge: 'badge-increase', text: '加仓' },
                 'fixed_stop': { badge: 'badge-fixed', text: '固定止损' },
-                'close_position': { badge: 'badge-close', text: '平仓' }
+                'close_position': { badge: 'badge-close', text: '平仓' },
+                'sell_to_close': { badge: 'badge-close', text: '平多' },
+                'buy_to_close': { badge: 'badge-close', text: '平空' },
+                'move_stop_loss': { badge: 'badge-fixed', text: '上移止损' },
+                'take_profit': { badge: 'badge-fixed', text: '止盈' },
+                'trailing_stop': { badge: 'badge-fixed', text: '移动止损' },
+                'auto_close': { badge: 'badge-close', text: '自动平仓' },
+                'hold': { badge: '', text: '持有' }
             };
-            const signal = signalMap[trade.signal] || { badge: '', text: trade.signal };
+            const signal = signalMap[trade.signal] || { badge: '', text: trade.action_text || trade.signal };
             const pnlClass = trade.pnl > 0 ? 'text-success' : trade.pnl < 0 ? 'text-danger' : '';
 
             return `

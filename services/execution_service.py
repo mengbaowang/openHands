@@ -24,6 +24,7 @@ class ExecutionService:
     }
     DEFAULT_STOP_LOSS_PCT = 0.03
     DEFAULT_TAKE_PROFIT_PCT = 0.06
+    EARLY_PROFIT_PROTECTION_PCT = 0.015
 
     def __init__(self, model_id: int, db, debug_log=None):
         self.model_id = model_id
@@ -38,6 +39,7 @@ class ExecutionService:
             self._debug_callback(message)
 
     def get_portfolio(self, current_prices: Dict) -> Dict:
+        self._reconcile_closed_positions(current_prices)
         return self._get_okx_portfolio(current_prices)
 
     def check_stop_loss_take_profit(self, portfolio: Dict, current_prices: Dict) -> list:
@@ -54,6 +56,59 @@ class ExecutionService:
             balance.get('available', portfolio['cash']),
             portfolio['positions_value']
         )
+
+    def _reconcile_closed_positions(self, current_prices: Dict) -> None:
+        """Backfill local close trades when OKX positions are gone but DB rows still exist."""
+        open_rows = self.db.get_open_portfolio_rows(self.model_id)
+        if not open_rows:
+            return
+
+        okx_positions = self.okx_trader.get_positions() or []
+        active_keys = {(pos['coin'], pos['side']) for pos in okx_positions if pos}
+
+        for row in open_rows:
+            key = (row['coin'], row['side'])
+            if key in active_keys:
+                continue
+
+            closed_snapshot = self.okx_trader.get_recent_closed_position(row['coin'], row['side'])
+            close_price = float(closed_snapshot.get('closeAvgPx', 0) or 0)
+            current_price = close_price or current_prices.get(row['coin'], row['avg_price'])
+            quantity = float(row['quantity'])
+            leverage = int(row['leverage'])
+            if closed_snapshot and closed_snapshot.get('realizedPnl') not in (None, ''):
+                pnl = float(closed_snapshot.get('realizedPnl', 0) or 0)
+            else:
+                if row['side'] == 'long':
+                    pnl = (current_price - row['avg_price']) * quantity
+                else:
+                    pnl = (row['avg_price'] - current_price) * quantity
+
+            trade_signal = 'sell_to_close' if row['side'] == 'long' else 'buy_to_close'
+            self._debug_log(
+                f"对账发现 {row['coin']} {row['side']} 已在 OKX 平仓，自动补记交易记录，价格 {current_price:.4f}"
+            )
+            timestamp = None
+            if closed_snapshot and closed_snapshot.get('uTime'):
+                try:
+                    timestamp = time.strftime(
+                        '%Y-%m-%d %H:%M:%S',
+                        time.gmtime(int(closed_snapshot['uTime']) / 1000)
+                    )
+                except Exception:
+                    timestamp = None
+            self.db.add_trade(
+                self.model_id,
+                row['coin'],
+                trade_signal,
+                quantity,
+                current_price,
+                leverage,
+                row['side'],
+                pnl=pnl,
+                timestamp=timestamp
+            )
+            self.db.close_position(self.model_id, row['coin'], row['side'])
 
     def _update_db_position_metrics(self, coin: str, position: Dict, metrics: Dict, db_pos: Dict = None) -> None:
         db_pos = db_pos or {}
@@ -81,6 +136,110 @@ class ExecutionService:
         if take_profit is None:
             take_profit = reference_price * (1 + self.DEFAULT_TAKE_PROFIT_PCT) if side == 'long' else reference_price * (1 - self.DEFAULT_TAKE_PROFIT_PCT)
         return stop_loss, take_profit
+
+    def _estimate_rr(self, side: str, current_price: float, stop_loss: float = None, take_profit: float = None) -> float:
+        if stop_loss is None or take_profit is None:
+            return 0.0
+        if side == 'long':
+            reward = take_profit - current_price
+            risk = current_price - stop_loss
+        else:
+            reward = current_price - take_profit
+            risk = stop_loss - current_price
+        if risk <= 0:
+            return 0.0
+        return reward / risk
+
+    def _macd_tail_is_weakening(self, side: str, tail) -> bool:
+        if not isinstance(tail, list) or len(tail) < 3:
+            return False
+        a, b, c = tail[-3], tail[-2], tail[-1]
+        if side == 'long':
+            return c < b < a
+        return c > b > a
+
+    def _timeframe_is_weakening(self, side: str, indicators: Dict) -> bool:
+        if not indicators:
+            return False
+
+        current_price = float(indicators.get('current_price', 0) or 0)
+        sma5 = float(indicators.get('sma_5', 0) or 0)
+        rsi = float(indicators.get('rsi_14', 50) or 50)
+        macd_hist = float(indicators.get('macd_histogram', 0) or 0)
+        macd_tail = indicators.get('macd_histogram_tail', [])
+
+        signals = 0
+        if side == 'long':
+            if rsi < 55:
+                signals += 1
+            if macd_hist < 0 or self._macd_tail_is_weakening(side, macd_tail):
+                signals += 1
+            if sma5 > 0 and current_price < sma5:
+                signals += 1
+        else:
+            if rsi > 45:
+                signals += 1
+            if macd_hist > 0 or self._macd_tail_is_weakening(side, macd_tail):
+                signals += 1
+            if sma5 > 0 and current_price > sma5:
+                signals += 1
+
+        return signals >= 2
+
+    def _get_break_even_stop(self, entry_price: float, side: str, leverage: int) -> float:
+        fee_adjustment = 0.001 / max(float(leverage or 1), 1.0)
+        if side == 'long':
+            return entry_price * (1 + fee_adjustment)
+        return entry_price * (1 - fee_adjustment)
+
+    def _get_entry_margin_ratio(self, decision: Dict, market_state: Dict, coin: str, side: str) -> tuple[float, list[str]]:
+        confidence = float(decision.get('confidence') or 0)
+        if confidence >= 0.75:
+            ratio = 0.10
+        elif confidence >= 0.60:
+            ratio = 0.08
+        elif confidence >= 0.50:
+            ratio = 0.06
+        else:
+            ratio = 0.04
+
+        reasons = []
+        timeframes = market_state[coin].get('timeframes', {})
+        tf_1h = timeframes.get('1h', {})
+        tf_15m = timeframes.get('15m', {})
+        current_price = market_state[coin]['price']
+
+        if side == 'long':
+            near_extreme = (
+                (tf_1h.get('recent_high_20') and current_price >= float(tf_1h.get('recent_high_20')) * 0.995) or
+                (tf_15m.get('recent_high_20') and current_price >= float(tf_15m.get('recent_high_20')) * 0.995)
+            )
+            overheated = float(tf_1h.get('rsi_14', 0) or 0) >= 70 or float(tf_15m.get('rsi_14', 0) or 0) >= 70
+        else:
+            near_extreme = (
+                (tf_1h.get('recent_low_20') and current_price <= float(tf_1h.get('recent_low_20')) * 1.005) or
+                (tf_15m.get('recent_low_20') and current_price <= float(tf_15m.get('recent_low_20')) * 1.005)
+            )
+            overheated = float(tf_1h.get('rsi_14', 100) or 100) <= 30 or float(tf_15m.get('rsi_14', 100) or 100) <= 30
+
+        rr = self._estimate_rr(
+            side,
+            current_price,
+            decision.get('stop_loss'),
+            decision.get('profit_target') or decision.get('take_profit')
+        )
+
+        if near_extreme:
+            ratio *= 0.65
+            reasons.append('接近短线极值位')
+        if overheated:
+            ratio *= 0.75
+            reasons.append('趋势偏热/偏冷')
+        if 0 < rr < 2.2:
+            ratio *= 0.75
+            reasons.append('风险回报比仅勉强达标')
+
+        return max(ratio, 0.02), reasons
 
     def _sync_okx_native_risk_order(self, coin: str, side: str, contracts: float,
                                     stop_loss: float = None, take_profit: float = None,
@@ -245,8 +404,76 @@ class ExecutionService:
             peak_profit_pct = metrics['peak_profit_pct']
             drawdown_ratio = metrics['drawdown_ratio']
             peak_price = metrics['peak_price']
+            timeframes = current_prices.get('__timeframes__', {})
+            coin_timeframes = timeframes.get(coin, {})
 
             self._debug_log(f"{coin} 净浮盈 {current_profit_pct*100:.2f}%, 峰值净浮盈 {peak_profit_pct*100:.2f}%, 峰值价 {peak_price:.2f}")
+
+            weak_15m = self._timeframe_is_weakening(side, coin_timeframes.get('15m', {}))
+            weak_5m = self._timeframe_is_weakening(side, coin_timeframes.get('5m', {}))
+
+            if peak_profit_pct >= self.EARLY_PROFIT_PROTECTION_PCT and weak_15m and weak_5m:
+                break_even_stop = self._get_break_even_stop(entry_price, side, int(position['leverage']))
+                below_break_even = (
+                    (side == 'long' and current_price <= break_even_stop) or
+                    (side == 'short' and current_price >= break_even_stop) or
+                    current_profit_pct <= 0
+                )
+
+                if below_break_even:
+                    close_result = self._execute_close_okx(
+                        coin,
+                        {'signal': 'sell_to_close' if side == 'long' else 'buy_to_close', 'quantity': position.get('quantity', 0)},
+                        {coin: {'price': current_price}},
+                        portfolio,
+                        close_all=True
+                    )
+                    close_result['reason'] = (
+                        f'早期利润保护触发：峰值净浮盈 {peak_profit_pct*100:.2f}% 后，15M/5M 同时转弱，'
+                        f'且当前价格已跌破保本附近（保本位 ${break_even_stop:.2f}）'
+                    )
+                    results.append(close_result)
+                    continue
+
+                improved_break_even = (
+                    stop_loss is None or
+                    (side == 'long' and break_even_stop > stop_loss) or
+                    (side == 'short' and break_even_stop < stop_loss)
+                )
+                if improved_break_even:
+                    risk_sync = self._sync_okx_native_risk_order(
+                        coin,
+                        side=side,
+                        contracts=position.get('contracts', position.get('size', 0)),
+                        stop_loss=break_even_stop,
+                        take_profit=take_profit,
+                        db_pos=db_pos
+                    )
+                    if risk_sync.get('success'):
+                        self.db.update_position(
+                            self.model_id,
+                            coin,
+                            position.get('quantity', position.get('coin_quantity', 0.0)),
+                            entry_price,
+                            position['leverage'],
+                            side,
+                            break_even_stop,
+                            take_profit,
+                            entry_ord_id=db_pos.get('entry_ord_id'),
+                            okx_risk_algo_id=risk_sync.get('algo_id'),
+                            okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
+                            trailing_tier=max(float(db_pos.get('trailing_tier') or 0), 0.005),
+                            peak_price=peak_price,
+                            peak_profit_pct=peak_profit_pct,
+                            last_profit_pct=current_profit_pct
+                        )
+                        results.append({
+                            'coin': coin,
+                            'signal': 'move_stop_loss',
+                            'price': current_price,
+                            'message': f'{coin} 达到早期利润保护条件，止损上移至保本价 ${break_even_stop:.2f}'
+                        })
+                        stop_loss = break_even_stop
 
             if peak_profit_pct >= self.peak_profit_activation_pct and drawdown_ratio >= self.peak_drawdown_close_ratio:
                 close_result = self._execute_close_okx(
@@ -387,6 +614,16 @@ class ExecutionService:
         if 'error' in balance:
             return {'coin': coin, 'error': f'Failed to get balance: {balance["error"]}'}
         required_margin = (quantity * current_price) / leverage
+        entry_ratio_cap, cap_reasons = self._get_entry_margin_ratio(decision, market_state, coin, 'long')
+        max_margin_allowed = balance.get('available', 0) * entry_ratio_cap
+        if required_margin > max_margin_allowed and max_margin_allowed > 0:
+            adjusted_quantity = max_margin_allowed * leverage / current_price
+            quantity = max(0.0, adjusted_quantity)
+            self._debug_log(
+                f"{coin} 仓位因{','.join(cap_reasons) if cap_reasons else '风险预算'}收缩，新的下单数量 {quantity:.4f}"
+            )
+            self._validate_quantity(quantity, coin)
+            required_margin = (quantity * current_price) / leverage
         if balance.get('available', 0) < required_margin:
             return {'coin': coin, 'error': f'Insufficient balance: need {required_margin:.2f}, have {balance.get("available", 0):.2f}'}
 
@@ -437,6 +674,16 @@ class ExecutionService:
         if 'error' in balance:
             return {'coin': coin, 'error': f'Failed to get balance: {balance["error"]}'}
         required_margin = (quantity * current_price) / leverage
+        entry_ratio_cap, cap_reasons = self._get_entry_margin_ratio(decision, market_state, coin, 'short')
+        max_margin_allowed = balance.get('available', 0) * entry_ratio_cap
+        if required_margin > max_margin_allowed and max_margin_allowed > 0:
+            adjusted_quantity = max_margin_allowed * leverage / current_price
+            quantity = max(0.0, adjusted_quantity)
+            self._debug_log(
+                f"{coin} 仓位因{','.join(cap_reasons) if cap_reasons else '风险预算'}收缩，新的下单数量 {quantity:.4f}"
+            )
+            self._validate_quantity(quantity, coin)
+            required_margin = (quantity * current_price) / leverage
         if balance.get('available', 0) < required_margin:
             return {'coin': coin, 'error': f'Insufficient balance: need {required_margin:.2f}, have {balance.get("available", 0):.2f}'}
 

@@ -4,9 +4,21 @@ import config
 import time
 import requests
 import uuid
+import json
 
 class OKXTrader:
     """OKX 模拟盘交易器"""
+
+    TRANSIENT_ERROR_KEYWORDS = (
+        'temporarily unavailable',
+        'connection',
+        'timed out',
+        '10035',
+        'Expecting value',
+        'Remote end closed connection',
+        'Connection aborted',
+        'Connection reset'
+    )
 
     def __init__(self):
         # 初始化 OKX 客户端
@@ -125,11 +137,14 @@ class OKXTrader:
         for attempt in range(max_retries):
             try:
                 result = self.account_api.get_account_balance()
+                if not isinstance(result, dict):
+                    raise ValueError(f'Unexpected balance response type: {type(result)}')
                 if result.get('code') != '0':
                     error_msg = result.get('msg')
                     print(f"[ERROR] API 返回错误: {error_msg}")
-                    if attempt < max_retries - 1 and 'temporarily unavailable' in error_msg.lower():
+                    if attempt < max_retries - 1 and error_msg and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
                         print(f"[ERROR] 暂时不可用，{retry_delay}秒后重试...")
+                        time.sleep(retry_delay)
                         continue
                     return {'error': error_msg}
 
@@ -182,68 +197,78 @@ class OKXTrader:
             except Exception as e:
                 error_msg = str(e)
                 print(f"[ERROR] 获取余额异常: {error_msg}")
-                if attempt < max_retries - 1 and 'connection' in error_msg.lower():
+                if attempt < max_retries - 1 and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
                     print(f"[ERROR] 网络异常，{retry_delay}秒后重试...")
+                    time.sleep(retry_delay)
                     continue
                 return {'error': error_msg}
 
     def get_positions(self) -> list:
         """获取持仓信息"""
-        try:
-            # 查询账户配置
+        max_retries = 3
+        retry_delay = 2
+        for attempt in range(max_retries):
             try:
-                config_result = self.account_api.get_account_config()
-                if config_result.get('code') == '0' and config_result.get('data'):
-                    config_data = config_result.get('data', [{}])[0]
-                    self._debug_log(
-                        'account_config_summary',
-                        f"[DEBUG] 账户配置: posMode={config_data.get('posMode')}, acctLv={config_data.get('acctLv')}"
-                    )
-            except Exception as e:
-                print(f"[ERROR] 查询账户配置失败: {e}")
+            # 查询账户配置
+                try:
+                    config_result = self.account_api.get_account_config()
+                    if not isinstance(config_result, dict):
+                        raise ValueError(f'Unexpected account config response type: {type(config_result)}')
+                    if config_result.get('code') == '0' and config_result.get('data'):
+                        config_data = config_result.get('data', [{}])[0]
+                        self._debug_log(
+                            'account_config_summary',
+                            f"[DEBUG] 账户配置: posMode={config_data.get('posMode')}, acctLv={config_data.get('acctLv')}"
+                        )
+                except Exception as e:
+                    print(f"[ERROR] 查询账户配置失败: {e}")
 
-            # 查询所有支持的币种
-            all_positions = []
-            # 从配置文件获取交易对列表
-            inst_ids = list(config.OKX_SYMBOLS.values())
-            for inst_id in inst_ids:
-                inst_result = self.account_api.get_positions(instId=inst_id)
-                if inst_result.get('code') == '0':
-                    data = inst_result.get('data', [])
-                    if data:
-                        for pos in data:
-                            if float(pos.get('pos', 0)) != 0:
-                                coin = pos.get('instId').split('-')[0]
-                                contracts = float(pos.get('pos', 0))
-                                avg_price = float(pos.get('avgPx', 0))
-                                instrument = self.get_instrument_spec(pos.get('instId'))
-                                all_positions.append({
-                                    'coin': coin,
-                                    'inst_id': pos.get('instId'),
-                                    'side': pos.get('posSide'),
-                                    'size': contracts,
-                                    'contracts': contracts,
-                                    'avg_price': avg_price,
-                                    'coin_quantity': self.contracts_to_coin_quantity(coin, contracts, avg_price),
-                                    'face_value': self.get_contract_face_value(coin),
-                                    'lot_size': float(instrument.get('lotSz', 1) or 1),
-                                    'min_size': float(instrument.get('minSz', 1) or 1),
-                                    'notional_usdt': self.contracts_to_notional_usdt(coin, contracts, avg_price),
-                                    'leverage': int(pos.get('lever', 1)),
-                                    'unrealized_pnl': float(pos.get('upl', 0)),
-                                    'mgnMode': pos.get('mgnMode', ''),
-                                    'posId': pos.get('posId', '')
-                                })
-            # 打印持仓信息
-            for idx, pos in enumerate(all_positions):
-                self._debug_log(
-                    f'final_position:{pos["inst_id"]}:{idx}',
-                    f"[DEBUG] 最终持仓 #{idx}: instId={pos['inst_id']}, pos={pos['size']}"
-                )
-            return all_positions
-        except Exception as e:
-            print(f"[ERROR] 获取持仓信息失败: {e}")
-            return []
+                all_positions = []
+                inst_ids = list(config.OKX_SYMBOLS.values())
+                for inst_id in inst_ids:
+                    inst_result = self.account_api.get_positions(instId=inst_id)
+                    if not isinstance(inst_result, dict):
+                        raise ValueError(f'Unexpected positions response type: {type(inst_result)}')
+                    if inst_result.get('code') == '0':
+                        data = inst_result.get('data', [])
+                        if data:
+                            for pos in data:
+                                if float(pos.get('pos', 0)) != 0:
+                                    coin = pos.get('instId').split('-')[0]
+                                    contracts = float(pos.get('pos', 0))
+                                    avg_price = float(pos.get('avgPx', 0))
+                                    instrument = self.get_instrument_spec(pos.get('instId'))
+                                    all_positions.append({
+                                        'coin': coin,
+                                        'inst_id': pos.get('instId'),
+                                        'side': pos.get('posSide'),
+                                        'size': contracts,
+                                        'contracts': contracts,
+                                        'avg_price': avg_price,
+                                        'coin_quantity': self.contracts_to_coin_quantity(coin, contracts, avg_price),
+                                        'face_value': self.get_contract_face_value(coin),
+                                        'lot_size': float(instrument.get('lotSz', 1) or 1),
+                                        'min_size': float(instrument.get('minSz', 1) or 1),
+                                        'notional_usdt': self.contracts_to_notional_usdt(coin, contracts, avg_price),
+                                        'leverage': int(pos.get('lever', 1)),
+                                        'unrealized_pnl': float(pos.get('upl', 0)),
+                                        'mgnMode': pos.get('mgnMode', ''),
+                                        'posId': pos.get('posId', '')
+                                    })
+                for idx, pos in enumerate(all_positions):
+                    self._debug_log(
+                        f'final_position:{pos["inst_id"]}:{idx}',
+                        f"[DEBUG] 最终持仓 #{idx}: instId={pos['inst_id']}, pos={pos['size']}"
+                    )
+                return all_positions
+            except Exception as e:
+                error_msg = str(e)
+                print(f"[ERROR] 获取持仓信息失败: {error_msg}")
+                if attempt < max_retries - 1 and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
+                    print(f"[ERROR] 持仓接口异常，{retry_delay}秒后重试...")
+                    time.sleep(retry_delay)
+                    continue
+                return []
 
     def get_order_status(self, ord_id: str, inst_id: str) -> dict:
         """查询订单状态"""
@@ -365,6 +390,16 @@ class OKXTrader:
                 'algoClOrdId': algo_cl_ord_id or ''
             }]
             result = self.trade_api.cancel_algo_order(params)
+            if result.get('code') == '1':
+                data = result.get('data', []) or []
+                for item in data:
+                    if item.get('sCode') == '51400':
+                        return {
+                            'success': True,
+                            'message': f'Native TP/SL already inactive for {coin}',
+                            'already_inactive': True,
+                            'raw': result
+                        }
             if result.get('code') != '0':
                 return {'success': False, 'error': result.get('msg'), 'raw': result}
             return {'success': True, 'message': f'Native TP/SL canceled for {coin}'}
@@ -559,5 +594,22 @@ class OKXTrader:
         except Exception as e:
             print(f"[ERROR] Get account config failed: {e}")
             return {'success': False, 'error': str(e)}
+
+    def get_recent_closed_position(self, coin: str, side: str) -> dict:
+        """Get the most recent closed position snapshot for a coin/side pair."""
+        try:
+            result = self.account_api.get_positions_history(instType='SWAP')
+            if not isinstance(result, dict) or result.get('code') != '0':
+                return {}
+
+            target_inst_id = config.OKX_SYMBOLS.get(coin)
+            target_direction = 'long' if side == 'long' else 'short'
+            for item in result.get('data', []):
+                if item.get('instId') == target_inst_id and item.get('posSide') == target_direction:
+                    return item
+            return {}
+        except Exception as e:
+            print(f"[ERROR] 获取历史平仓持仓失败: {e}")
+            return {}
 
 # 测试代码

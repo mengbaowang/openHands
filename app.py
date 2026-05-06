@@ -27,6 +27,22 @@ app.secret_key = os.environ.get('SECRET_KEY', '8XRxYeeymuCa2URjWcg6AIKPo')
 CORS(app, supports_credentials=True)
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
+SIGNAL_TEXT_MAP = {
+    'buy_to_enter': '开多',
+    'sell_to_enter': '开空',
+    'sell_to_close': '平多',
+    'buy_to_close': '平空',
+    'close_position': '平仓',
+    'reduce_position': '减仓',
+    'increase_position': '加仓',
+    'move_stop_loss': '上移止损',
+    'auto_close': '自动平仓',
+    'hold': '持有',
+    'fixed_stop': '固定止损',
+    'take_profit': '止盈',
+    'trailing_stop': '移动止损'
+}
+
 # 版本号用于缓存清理 - 使用当前时间戳
 import time
 APP_VERSION = str(int(time.time()))
@@ -35,6 +51,11 @@ APP_VERSION = str(int(time.time()))
 @app.context_processor
 def inject_version():
     return {'app_version': APP_VERSION}
+
+
+def map_signal_to_text(signal: str) -> str:
+    """将内部交易信号映射为中文展示文案。"""
+    return SIGNAL_TEXT_MAP.get(signal, signal or '')
 
 def _should_log_request(log_key: str, interval_seconds: int = 180) -> bool:
     now = time.time()
@@ -433,6 +454,7 @@ def get_trades(model_id):
     for trade in trades:
         if 'timestamp' in trade:
             trade['timestamp'] = utc_to_beijing(trade['timestamp'])
+        trade['action_text'] = map_signal_to_text(trade.get('signal'))
 
     return jsonify(trades)
 
@@ -1135,6 +1157,7 @@ def get_recent_trades():
                 'model_name': row['model_name'],
                 'coin': row['coin'],
                 'action': row['signal'],  # 映射signal到action
+                'action_text': map_signal_to_text(row['signal']),
                 'quantity': row['quantity'],
                 'price': row['price'],
                 'leverage': row['leverage'],

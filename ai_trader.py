@@ -102,9 +102,10 @@ CURRENT POSITIONS:
 
         prompt += """
 EXECUTION RULES YOU MUST RESPECT:
-- The engine already enforces hard stop-losses and a mandatory full close when net floating profit retraces 20% from the position's peak net floating profit after peak profit reaches at least 3%.
+- The engine already enforces hard stop-losses, early profit protection once peak net profit reaches 1.5% and both 15M/5M weaken, and a mandatory full close when net floating profit retraces 20% from the position's peak net floating profit after peak profit reaches at least 3%.
 - Do not assume missing data. If 1H/15M/5M alignment or RR cannot be justified from the supplied data, prefer `hold`.
 - Use the supplied net profit percentages as the source of truth for position profit state.
+- If a setup is only marginally valid, near short-term resistance/support, or already overextended, explicitly reduce quantity rather than using a normal-sized entry.
 
 OUTPUT FORMAT (JSON only):
 ```json

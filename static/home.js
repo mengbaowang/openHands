@@ -512,8 +512,12 @@ class TradingDashboard {
                 const actionClass = actionMeta.cls;
                 const actionText = trade.action_text || actionMeta.text;
                 const actionColor = actionMeta.color;
-                const pnlClass = trade.pnl && trade.pnl >= 0 ? 'positive' : 'negative';
-                const pnlValue = trade.pnl || 0;
+                const netPnl = trade.net_pnl ?? trade.pnl ?? 0;
+                const grossPnl = trade.gross_pnl ?? trade.pnl ?? 0;
+                const fee = trade.fee ?? 0;
+                const pnlClass = netPnl >= 0 ? 'positive' : 'negative';
+                const pnlValue = netPnl;
+                const pnlTitle = `毛盈亏: $${grossPnl.toFixed(2)} | 手续费: $${fee.toFixed(2)} | 净盈亏: $${netPnl.toFixed(2)}`;
 
                 return `
                     <div class="trade-feed-item">
@@ -540,10 +544,10 @@ class TradingDashboard {
                                 <span class="detail-label">数量:</span>
                                 <span class="detail-value">${trade.quantity.toFixed(4)}</span>
                             </div>
-                            ${trade.pnl !== null && trade.pnl !== 0 ? `
+                            ${netPnl !== null && netPnl !== 0 ? `
                                 <div class="trade-feed-detail-item">
                                     <span class="detail-label">盈亏:</span>
-                                    <span class="detail-value ${pnlClass}" style="font-weight: 700;">
+                                    <span class="detail-value ${pnlClass}" style="font-weight: 700;" title="${pnlTitle}">
                                         ${pnlValue >= 0 ? '+' : ''}$${pnlValue.toFixed(2)}
                                     </span>
                                 </div>

@@ -455,6 +455,9 @@ def get_trades(model_id):
         if 'timestamp' in trade:
             trade['timestamp'] = utc_to_beijing(trade['timestamp'])
         trade['action_text'] = map_signal_to_text(trade.get('signal'))
+        trade['net_pnl'] = trade.get('pnl', 0)
+        trade['gross_pnl'] = trade.get('gross_pnl', trade.get('pnl', 0))
+        trade['fee'] = trade.get('fee', 0)
 
     return jsonify(trades)
 
@@ -587,7 +590,7 @@ def get_user_analytics():
             cursor.execute('''
                 SELECT
                     COUNT(*) as trade_count,
-                    SUM(CASE WHEN signal = 'buy_to_enter' OR signal = 'sell_to_enter' THEN price * quantity * 0.001 ELSE 0 END) as total_fees,
+                    COALESCE(SUM(fee), 0) as total_fees,
                     SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as win_count,
                     MAX(pnl) as biggest_win,
                     MIN(pnl) as biggest_loss
@@ -762,7 +765,7 @@ def get_detailed_leaderboard():
                 m.initial_capital,
                 av.total_value,
                 COUNT(DISTINCT t.id) as trade_count,
-                SUM(CASE WHEN t.signal = 'buy_to_enter' OR t.signal = 'sell_to_enter' THEN t.price * t.quantity * 0.001 ELSE 0 END) as total_fees,
+                COALESCE(SUM(t.fee), 0) as total_fees,
                 SUM(CASE WHEN t.pnl > 0 THEN 1 ELSE 0 END) as win_count,
                 MAX(t.pnl) as biggest_win,
                 MIN(t.pnl) as biggest_loss
@@ -1140,6 +1143,8 @@ def get_recent_trades():
                 t.price,
                 t.leverage,
                 t.pnl,
+                t.gross_pnl,
+                t.fee,
                 t.timestamp
             FROM trades t
             JOIN models m ON t.model_id = m.id
@@ -1162,6 +1167,9 @@ def get_recent_trades():
                 'price': row['price'],
                 'leverage': row['leverage'],
                 'pnl': row['pnl'],
+                'net_pnl': row['pnl'],
+                'gross_pnl': row['gross_pnl'] if 'gross_pnl' in row.keys() else row['pnl'],
+                'fee': row['fee'] if 'fee' in row.keys() else 0,
                 'created_at': beijing_time  # 映射timestamp到created_at，并转换为东八区
             })
 

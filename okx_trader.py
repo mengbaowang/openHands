@@ -50,7 +50,7 @@ class OKXTrader:
             print(f"[INFO] 设置超时失败: {e}")
 
     def _debug_log(self, key: str, message: str, interval_seconds: int = 180) -> None:
-        """Throttle noisy debug logs."""
+        """调试日志记录器，避免频繁打印"""
         now = time.time()
         last_logged = self._debug_timestamps.get(key, 0)
         if now - last_logged >= interval_seconds:
@@ -58,7 +58,7 @@ class OKXTrader:
             print(message)
 
     def get_contract_face_value(self, coin: str) -> float:
-        """Return the swap contract value in base coin units."""
+        """获取合约面值，单位为基础币"""
         inst_id = config.OKX_SYMBOLS.get(coin)
         if not inst_id:
             return 0.0
@@ -66,7 +66,7 @@ class OKXTrader:
         return float(instrument.get('ctVal', 0))
 
     def get_instrument_spec(self, inst_id: str) -> dict:
-        """Fetch and cache OKX instrument metadata."""
+        """获取合约规格"""
         if inst_id in self._instrument_cache:
             return self._instrument_cache[inst_id]
 
@@ -85,7 +85,7 @@ class OKXTrader:
         return instrument
 
     def normalize_contracts(self, coin: str, contracts: float, round_up: bool = False) -> float:
-        """Normalize contract size to OKX lot size rules."""
+        """归一化合约数量，符合OKX交易规则"""
         inst_id = config.OKX_SYMBOLS.get(coin)
         if not inst_id:
             raise ValueError(f'Unsupported coin: {coin}')
@@ -110,7 +110,7 @@ class OKXTrader:
         return round(normalized, precision)
 
     def coin_quantity_to_contracts(self, coin: str, quantity: float, price: float, round_up: bool = False) -> int:
-        """Convert base coin quantity to OKX contract count."""
+        """将基础币数量转换为合约数量"""
         face_value = self.get_contract_face_value(coin)
         if face_value <= 0:
             raise ValueError(f'Invalid contract value for {coin}: {face_value}')
@@ -119,11 +119,11 @@ class OKXTrader:
         return self.normalize_contracts(coin, raw_contracts, round_up=round_up)
 
     def contracts_to_coin_quantity(self, coin: str, contracts: float, price: float) -> float:
-        """Convert OKX contract count to base coin quantity."""
+        """将合约数量转换为基础币数量"""
         return float(contracts) * self.get_contract_face_value(coin)
 
     def contracts_to_notional_usdt(self, coin: str, contracts: float, price: float) -> float:
-        """Convert OKX contract count to notional USDT."""
+        """将合约数量转换为USDT价值"""
         return self.contracts_to_coin_quantity(coin, contracts, price) * float(price)
 
     def get_balance(self) -> dict:
@@ -138,7 +138,7 @@ class OKXTrader:
             try:
                 result = self.account_api.get_account_balance()
                 if not isinstance(result, dict):
-                    raise ValueError(f'Unexpected balance response type: {type(result)}')
+                    raise ValueError(f'余额响应类型异常: {type(result)}')
                 if result.get('code') != '0':
                     error_msg = result.get('msg')
                     print(f"[ERROR] API 返回错误: {error_msg}")
@@ -376,7 +376,7 @@ class OKXTrader:
             return {'success': False, 'error': str(e)}
 
     def cancel_native_risk_order(self, coin: str, algo_id: str = None, algo_cl_ord_id: str = None) -> dict:
-        """Cancel exchange-native TP/SL algo order."""
+        """取消本地风险订单"""
         try:
             inst_id = config.OKX_SYMBOLS.get(coin)
             if not inst_id:
@@ -596,7 +596,7 @@ class OKXTrader:
             return {'success': False, 'error': str(e)}
 
     def get_recent_closed_position(self, coin: str, side: str) -> dict:
-        """Get the most recent closed position snapshot for a coin/side pair."""
+        """获取最近平仓持仓"""
         try:
             result = self.account_api.get_positions_history(instType='SWAP')
             if not isinstance(result, dict) or result.get('code') != '0':
@@ -611,5 +611,3 @@ class OKXTrader:
         except Exception as e:
             print(f"[ERROR] 获取历史平仓持仓失败: {e}")
             return {}
-
-# 测试代码

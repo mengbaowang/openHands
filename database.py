@@ -82,6 +82,7 @@ class Database:
                 stop_loss REAL,
                 take_profit REAL,
                 entry_ord_id TEXT,
+                entry_fee REAL DEFAULT 0,
                 okx_risk_algo_id TEXT,
                 okx_risk_algo_cl_ord_id TEXT,
                 trailing_tier REAL DEFAULT 0,
@@ -107,6 +108,11 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE portfolios ADD COLUMN entry_ord_id TEXT')
+        except:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN entry_fee REAL DEFAULT 0')
         except:
             pass
 
@@ -152,10 +158,24 @@ class Database:
                 leverage INTEGER DEFAULT 1,
                 side TEXT DEFAULT 'long',
                 pnl REAL DEFAULT 0,
+                gross_pnl REAL DEFAULT 0,
+                fee REAL DEFAULT 0,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (model_id) REFERENCES models(id)
             )
         ''')
+
+        try:
+            cursor.execute('ALTER TABLE trades ADD COLUMN gross_pnl REAL DEFAULT 0')
+        except:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE trades ADD COLUMN fee REAL DEFAULT 0')
+        except:
+            pass
+
+        self._backfill_fee_columns(cursor)
         
         # Conversations table
         cursor.execute('''
@@ -252,7 +272,8 @@ class Database:
     def update_position(self, model_id: int, coin: str, quantity: float,
                        avg_price: float, leverage: int = 1, side: str = 'long',
                        stop_loss: float = None, take_profit: float = None,
-                       entry_ord_id: str = None, okx_risk_algo_id: str = None,
+                       entry_ord_id: str = None, entry_fee: float = None,
+                       okx_risk_algo_id: str = None,
                        okx_risk_algo_cl_ord_id: str = None, trailing_tier: float = 0,
                        peak_price: float = None, peak_profit_pct: float = None,
                        last_profit_pct: float = None):
@@ -265,10 +286,10 @@ class Database:
         cursor.execute('''
             INSERT INTO portfolios (
                 model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
-                entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
+                entry_ord_id, entry_fee, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
                 peak_price, peak_profit_pct, last_profit_pct, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(model_id, coin, side) DO UPDATE SET
                 quantity = excluded.quantity,
                 avg_price = excluded.avg_price,
@@ -276,6 +297,7 @@ class Database:
                 stop_loss = excluded.stop_loss,
                 take_profit = excluded.take_profit,
                 entry_ord_id = excluded.entry_ord_id,
+                entry_fee = excluded.entry_fee,
                 okx_risk_algo_id = excluded.okx_risk_algo_id,
                 okx_risk_algo_cl_ord_id = excluded.okx_risk_algo_cl_ord_id,
                 trailing_tier = excluded.trailing_tier,
@@ -285,16 +307,46 @@ class Database:
                 updated_at = CURRENT_TIMESTAMP
         ''', (
             model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
-            entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
+            entry_ord_id, 0 if entry_fee is None else entry_fee, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
             effective_peak_price, effective_peak_profit_pct, effective_last_profit_pct
         ))
         conn.commit()
         conn.close()
 
+    def _backfill_fee_columns(self, cursor):
+        """Best-effort backfill for newly added fee-aware columns."""
+        try:
+            cursor.execute("UPDATE trades SET gross_pnl = pnl WHERE gross_pnl IS NULL")
+            cursor.execute("UPDATE trades SET fee = 0 WHERE fee IS NULL")
+        except:
+            pass
+
+    def update_trade_financials(self, trade_id: int, gross_pnl: float, fee: float, net_pnl: float):
+        """Update gross/fee/net pnl for an existing trade row."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE trades
+            SET gross_pnl = ?, fee = ?, pnl = ?
+            WHERE id = ?
+        ''', (gross_pnl, fee, net_pnl, trade_id))
+        conn.commit()
+        conn.close()
+
+    def get_trade_by_id(self, trade_id: int) -> Optional[Dict]:
+        """Fetch a single trade row by id."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM trades WHERE id = ?', (trade_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
     def upsert_position_delta(self, model_id: int, coin: str, quantity_delta: float,
                               price: float, leverage: int = 1, side: str = 'long',
                               stop_loss: float = None, take_profit: float = None,
-                              entry_ord_id: str = None, okx_risk_algo_id: str = None,
+                              entry_ord_id: str = None, entry_fee: float = None,
+                              okx_risk_algo_id: str = None,
                               okx_risk_algo_cl_ord_id: str = None, trailing_tier: float = None,
                               peak_price: float = None, peak_profit_pct: float = None,
                               last_profit_pct: float = None) -> Dict:
@@ -303,6 +355,7 @@ class Database:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT quantity, avg_price, leverage, stop_loss, take_profit, entry_ord_id,
+                   entry_fee,
                    okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
                    peak_price, peak_profit_pct, last_profit_pct
             FROM portfolios
@@ -329,6 +382,7 @@ class Database:
                     'stop_loss': stop_loss,
                     'take_profit': take_profit,
                     'entry_ord_id': entry_ord_id,
+                    'entry_fee': entry_fee if entry_fee is not None else 0,
                     'okx_risk_algo_id': okx_risk_algo_id,
                     'okx_risk_algo_cl_ord_id': okx_risk_algo_cl_ord_id,
                     'trailing_tier': trailing_tier if trailing_tier is not None else 0,
@@ -343,7 +397,7 @@ class Database:
             cursor.execute('''
                 UPDATE portfolios
                 SET quantity = ?, avg_price = ?, leverage = ?, stop_loss = ?, take_profit = ?,
-                    entry_ord_id = ?, okx_risk_algo_id = ?, okx_risk_algo_cl_ord_id = ?, trailing_tier = ?,
+                    entry_ord_id = ?, entry_fee = ?, okx_risk_algo_id = ?, okx_risk_algo_cl_ord_id = ?, trailing_tier = ?,
                     peak_price = ?, peak_profit_pct = ?, last_profit_pct = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE model_id = ? AND coin = ? AND side = ?
@@ -354,6 +408,7 @@ class Database:
                 stop_loss if stop_loss is not None else existing['stop_loss'],
                 take_profit if take_profit is not None else existing['take_profit'],
                 entry_ord_id if entry_ord_id is not None else existing['entry_ord_id'],
+                entry_fee if entry_fee is not None else existing['entry_fee'],
                 okx_risk_algo_id if okx_risk_algo_id is not None else existing['okx_risk_algo_id'],
                 okx_risk_algo_cl_ord_id if okx_risk_algo_cl_ord_id is not None else existing['okx_risk_algo_cl_ord_id'],
                 trailing_tier if trailing_tier is not None else existing['trailing_tier'],
@@ -373,6 +428,7 @@ class Database:
                 'stop_loss': stop_loss if stop_loss is not None else existing['stop_loss'],
                 'take_profit': take_profit if take_profit is not None else existing['take_profit'],
                 'entry_ord_id': entry_ord_id if entry_ord_id is not None else existing['entry_ord_id'],
+                'entry_fee': entry_fee if entry_fee is not None else existing['entry_fee'],
                 'okx_risk_algo_id': okx_risk_algo_id if okx_risk_algo_id is not None else existing['okx_risk_algo_id'],
                 'okx_risk_algo_cl_ord_id': okx_risk_algo_cl_ord_id if okx_risk_algo_cl_ord_id is not None else existing['okx_risk_algo_cl_ord_id'],
                 'trailing_tier': trailing_tier if trailing_tier is not None else existing['trailing_tier'],
@@ -384,13 +440,13 @@ class Database:
         cursor.execute('''
             INSERT INTO portfolios (
                 model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
-                entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
+                entry_ord_id, entry_fee, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
                 peak_price, peak_profit_pct, last_profit_pct, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ''', (
             model_id, coin, float(quantity_delta), float(price), leverage, side, stop_loss, take_profit,
-            entry_ord_id, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier if trailing_tier is not None else 0,
+            entry_ord_id, entry_fee if entry_fee is not None else 0, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier if trailing_tier is not None else 0,
             peak_price if peak_price is not None else float(price),
             peak_profit_pct if peak_profit_pct is not None else 0,
             last_profit_pct if last_profit_pct is not None else 0
@@ -404,6 +460,7 @@ class Database:
             'stop_loss': stop_loss,
             'take_profit': take_profit,
             'entry_ord_id': entry_ord_id,
+            'entry_fee': entry_fee if entry_fee is not None else 0,
             'okx_risk_algo_id': okx_risk_algo_id,
             'okx_risk_algo_cl_ord_id': okx_risk_algo_cl_ord_id,
             'trailing_tier': trailing_tier if trailing_tier is not None else 0,
@@ -418,6 +475,7 @@ class Database:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT quantity, avg_price, leverage, stop_loss, take_profit, entry_ord_id,
+                   entry_fee,
                    okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
                    peak_price, peak_profit_pct, last_profit_pct
             FROM portfolios
@@ -445,6 +503,7 @@ class Database:
                 'stop_loss': existing['stop_loss'],
                 'take_profit': existing['take_profit'],
                 'entry_ord_id': existing['entry_ord_id'],
+                'entry_fee': existing['entry_fee'],
                 'okx_risk_algo_id': existing['okx_risk_algo_id'],
                 'okx_risk_algo_cl_ord_id': existing['okx_risk_algo_cl_ord_id'],
                 'trailing_tier': existing['trailing_tier'],
@@ -467,6 +526,7 @@ class Database:
             'stop_loss': existing['stop_loss'],
             'take_profit': existing['take_profit'],
             'entry_ord_id': existing['entry_ord_id'],
+            'entry_fee': existing['entry_fee'],
             'okx_risk_algo_id': existing['okx_risk_algo_id'],
             'okx_risk_algo_cl_ord_id': existing['okx_risk_algo_cl_ord_id'],
             'trailing_tier': existing['trailing_tier'],
@@ -503,20 +563,21 @@ class Database:
     
     def add_trade(self, model_id: int, coin: str, signal: str, quantity: float,
                   price: float, leverage: int = 1, side: str = 'long', pnl: float = 0,
+                  gross_pnl: float = 0, fee: float = 0,
                   timestamp: str = None):
         """Add trade record"""
         conn = self.get_connection()
         cursor = conn.cursor()
         if timestamp:
             cursor.execute('''
-                INSERT INTO trades (model_id, coin, signal, quantity, price, leverage, side, pnl, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (model_id, coin, signal, quantity, price, leverage, side, pnl, timestamp))
+                INSERT INTO trades (model_id, coin, signal, quantity, price, leverage, side, pnl, gross_pnl, fee, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (model_id, coin, signal, quantity, price, leverage, side, pnl, gross_pnl, fee, timestamp))
         else:
             cursor.execute('''
-                INSERT INTO trades (model_id, coin, signal, quantity, price, leverage, side, pnl)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (model_id, coin, signal, quantity, price, leverage, side, pnl))
+                INSERT INTO trades (model_id, coin, signal, quantity, price, leverage, side, pnl, gross_pnl, fee)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (model_id, coin, signal, quantity, price, leverage, side, pnl, gross_pnl, fee))
         conn.commit()
         conn.close()
     
@@ -693,7 +754,7 @@ class Database:
             ''', (model_id,))
             realized_pnl = cursor.fetchone()['total_pnl']
             conn.close()
-            
+
             for pos in positions_data:
                 coin = pos['coin']
                 if coin in current_prices:
@@ -706,7 +767,7 @@ class Database:
                     else:
                         pos_pnl = (pos['avg_price'] - current_price) * position_quantity
                     unrealized_pnl += pos_pnl
-                    
+
                     db_pos = self.get_position(model_id, coin, pos['side'])
                     pos_details.append({
                         'coin': coin,
@@ -719,6 +780,7 @@ class Database:
                         'pnl': pos_pnl,
                         'stop_loss': db_pos.get('stop_loss') if db_pos else None,
                         'take_profit': db_pos.get('take_profit') if db_pos else None,
+                        'entry_fee': db_pos.get('entry_fee') if db_pos else 0,
                         'peak_price': db_pos.get('peak_price') if db_pos else None,
                         'peak_profit_pct': db_pos.get('peak_profit_pct') if db_pos else 0,
                         'last_profit_pct': db_pos.get('last_profit_pct') if db_pos else 0,
@@ -749,7 +811,7 @@ class Database:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT stop_loss, take_profit, entry_ord_id, okx_risk_algo_id,
-                   okx_risk_algo_cl_ord_id, trailing_tier,
+                   entry_fee, okx_risk_algo_cl_ord_id, trailing_tier,
                    peak_price, peak_profit_pct, last_profit_pct
             FROM portfolios
             WHERE model_id = ? AND coin = ? AND side = ?

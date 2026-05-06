@@ -12,7 +12,7 @@ from services.exchanges.okx_adapter import OKXTrader
 
 
 class ExecutionService:
-    """OKX-backed execution layer responsible for order routing, exits, and position state."""
+    """执行服务，负责下单、平仓与持仓状态管理."""
 
     MAX_QUANTITY_BY_COIN = {
         'BTC': 10,
@@ -57,6 +57,23 @@ class ExecutionService:
             portfolio['positions_value']
         )
 
+    def _extract_order_fee(self, order_result: Dict) -> float:
+        try:
+            return abs(float(order_result.get('fee', 0) or 0))
+        except Exception:
+            return 0.0
+
+    def _extract_order_fill_details(self, order_status: Dict, fallback_price: float) -> tuple[float, float, float]:
+        """Return (avg_price, close_fee, gross_pnl) from a filled OKX order payload."""
+        try:
+            data = (order_status or {}).get('data', [{}])[0]
+            avg_price = float(data.get('avgPx', 0) or 0) or float(fallback_price)
+            close_fee = abs(float(data.get('fee', 0) or 0))
+            gross_pnl = float(data.get('pnl', 0) or 0)
+            return avg_price, close_fee, gross_pnl
+        except Exception:
+            return float(fallback_price), 0.0, 0.0
+
     def _reconcile_closed_positions(self, current_prices: Dict) -> None:
         """Backfill local close trades when OKX positions are gone but DB rows still exist."""
         open_rows = self.db.get_open_portfolio_rows(self.model_id)
@@ -76,13 +93,16 @@ class ExecutionService:
             current_price = close_price or current_prices.get(row['coin'], row['avg_price'])
             quantity = float(row['quantity'])
             leverage = int(row['leverage'])
+            fee = abs(float(closed_snapshot.get('fee', 0) or 0)) if closed_snapshot else 0.0
             if closed_snapshot and closed_snapshot.get('realizedPnl') not in (None, ''):
                 pnl = float(closed_snapshot.get('realizedPnl', 0) or 0)
+                gross_pnl = pnl + fee
             else:
                 if row['side'] == 'long':
-                    pnl = (current_price - row['avg_price']) * quantity
+                    gross_pnl = (current_price - row['avg_price']) * quantity
                 else:
-                    pnl = (row['avg_price'] - current_price) * quantity
+                    gross_pnl = (row['avg_price'] - current_price) * quantity
+                pnl = gross_pnl - fee
 
             trade_signal = 'sell_to_close' if row['side'] == 'long' else 'buy_to_close'
             self._debug_log(
@@ -106,6 +126,8 @@ class ExecutionService:
                 leverage,
                 row['side'],
                 pnl=pnl,
+                gross_pnl=gross_pnl,
+                fee=fee,
                 timestamp=timestamp
             )
             self.db.close_position(self.model_id, row['coin'], row['side'])
@@ -632,21 +654,23 @@ class ExecutionService:
             return {'coin': coin, 'error': f'OKX order failed: {okx_result.get("error", "Unknown error")}'}
 
         entry_ord_id = okx_result.get('ord_id')
-        self.okx_trader.get_order_status(entry_ord_id, config.OKX_SYMBOLS[coin])
+        order_status = self.okx_trader.get_order_status(entry_ord_id, config.OKX_SYMBOLS[coin])
         actual_position = self._get_okx_position_after_order(coin, 'long')
         actual_quantity = actual_position.get('coin_quantity', quantity) if actual_position else quantity
         actual_contracts = actual_position.get('contracts', self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)) if actual_position else self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)
         avg_price = actual_position.get('avg_price', current_price) if actual_position else current_price
         risk_sync = self._sync_okx_native_risk_order(coin, side='long', contracts=actual_contracts, stop_loss=stop_loss, take_profit=take_profit)
+        _, entry_fee, _ = self._extract_order_fill_details(order_status, avg_price)
         self.db.update_position(
             self.model_id, coin, actual_quantity, avg_price, leverage, 'long',
             stop_loss, take_profit,
             entry_ord_id=entry_ord_id,
+            entry_fee=entry_fee,
             okx_risk_algo_id=risk_sync.get('algo_id'),
             okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
             trailing_tier=0, peak_price=avg_price, peak_profit_pct=0, last_profit_pct=0
         )
-        self.db.add_trade(self.model_id, coin, 'buy_to_enter', actual_quantity, avg_price, leverage, 'long', pnl=0)
+        self.db.add_trade(self.model_id, coin, 'buy_to_enter', actual_quantity, avg_price, leverage, 'long', pnl=0, gross_pnl=0, fee=entry_fee)
         return {
             'coin': coin,
             'signal': 'buy_to_enter',
@@ -692,21 +716,23 @@ class ExecutionService:
             return {'coin': coin, 'error': f'OKX order failed: {okx_result.get("error", "Unknown error")}'}
 
         entry_ord_id = okx_result.get('ord_id')
-        self.okx_trader.get_order_status(entry_ord_id, config.OKX_SYMBOLS[coin])
+        order_status = self.okx_trader.get_order_status(entry_ord_id, config.OKX_SYMBOLS[coin])
         actual_position = self._get_okx_position_after_order(coin, 'short')
         actual_quantity = actual_position.get('coin_quantity', quantity) if actual_position else quantity
         actual_contracts = actual_position.get('contracts', self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)) if actual_position else self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)
         avg_price = actual_position.get('avg_price', current_price) if actual_position else current_price
         risk_sync = self._sync_okx_native_risk_order(coin, side='short', contracts=actual_contracts, stop_loss=stop_loss, take_profit=take_profit)
+        _, entry_fee, _ = self._extract_order_fill_details(order_status, avg_price)
         self.db.update_position(
             self.model_id, coin, actual_quantity, avg_price, leverage, 'short',
             stop_loss, take_profit,
             entry_ord_id=entry_ord_id,
+            entry_fee=entry_fee,
             okx_risk_algo_id=risk_sync.get('algo_id'),
             okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
             trailing_tier=0, peak_price=avg_price, peak_profit_pct=0, last_profit_pct=0
         )
-        self.db.add_trade(self.model_id, coin, 'sell_to_enter', actual_quantity, avg_price, leverage, 'short', pnl=0)
+        self.db.add_trade(self.model_id, coin, 'sell_to_enter', actual_quantity, avg_price, leverage, 'short', pnl=0, gross_pnl=0, fee=entry_fee)
         return {
             'coin': coin,
             'signal': 'sell_to_enter',
@@ -742,7 +768,10 @@ class ExecutionService:
         if not okx_result.get('success'):
             return {'coin': coin, 'error': f'OKX close failed: {okx_result.get("error", "Unknown error")}'}
 
+        import config
+        order_status = self.okx_trader.get_order_status(okx_result.get('ord_id'), config.OKX_SYMBOLS[coin])
         current_price = market_state[coin]['price']
+        fill_price, close_fee, order_gross_pnl = self._extract_order_fill_details(order_status, current_price)
         remaining_position = self._get_okx_position_after_order(coin, position['side'], previous_contracts=current_contracts)
         remaining_contracts = remaining_position.get('contracts', remaining_position['size']) if remaining_position else 0
         remaining_quantity = remaining_position.get('coin_quantity', 0.0) if remaining_position else 0.0
@@ -750,17 +779,27 @@ class ExecutionService:
         if actual_closed_quantity <= 0:
             return {'coin': coin, 'error': f'OKX close order accepted but position did not decrease for {coin}'}
 
-        if position['side'] == 'long':
-            pnl = (current_price - position['avg_price']) * actual_closed_quantity
+        entry_fee = abs(float(db_pos.get('entry_fee', 0) or 0)) if db_pos else 0.0
+        allocated_entry_fee = entry_fee if current_quantity <= 0 else entry_fee * (actual_closed_quantity / current_quantity)
+
+        if order_gross_pnl != 0 or actual_closed_quantity == current_quantity:
+            gross_pnl = order_gross_pnl
         else:
-            pnl = (position['avg_price'] - current_price) * actual_closed_quantity
+            if position['side'] == 'long':
+                gross_pnl = (fill_price - position['avg_price']) * actual_closed_quantity
+            else:
+                gross_pnl = (position['avg_price'] - fill_price) * actual_closed_quantity
+        pnl = gross_pnl - allocated_entry_fee - close_fee
 
         if remaining_contracts <= 0 or remaining_quantity <= 0:
             self._sync_okx_native_risk_order(coin, side=position['side'], contracts=0, stop_loss=None, take_profit=None, db_pos=db_pos)
             self.db.close_position(self.model_id, coin, position['side'])
-            self.db.add_trade(self.model_id, coin, 'close_position', actual_closed_quantity, current_price, position['leverage'], position['side'], pnl=pnl)
+            self.db.add_trade(
+                self.model_id, coin, 'close_position', actual_closed_quantity, fill_price,
+                position['leverage'], position['side'], pnl=pnl, gross_pnl=gross_pnl, fee=allocated_entry_fee + close_fee
+            )
             result_signal = 'sell_to_close' if position['side'] == 'long' else 'buy_to_close'
-            message = f'(OKX) Close all {coin}, P&L: ${pnl:.2f}'
+            message = f'(OKX) Close all {coin}, Net P&L: ${pnl:.2f}'
         else:
             risk_sync = self._sync_okx_native_risk_order(
                 coin, side=position['side'], contracts=remaining_contracts,
@@ -773,6 +812,7 @@ class ExecutionService:
                 db_pos.get('stop_loss') if db_pos else None,
                 db_pos.get('take_profit') if db_pos else None,
                 entry_ord_id=db_pos.get('entry_ord_id') if db_pos else None,
+                entry_fee=max(0.0, entry_fee - allocated_entry_fee),
                 okx_risk_algo_id=risk_sync.get('algo_id') if risk_sync else db_pos.get('okx_risk_algo_id') if db_pos else None,
                 okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id') if risk_sync else db_pos.get('okx_risk_algo_cl_ord_id') if db_pos else None,
                 trailing_tier=db_pos.get('trailing_tier') if db_pos else 0,
@@ -780,9 +820,12 @@ class ExecutionService:
                 peak_profit_pct=db_pos.get('peak_profit_pct') if db_pos else 0,
                 last_profit_pct=db_pos.get('last_profit_pct') if db_pos else 0
             )
-            self.db.add_trade(self.model_id, coin, 'reduce_position', actual_closed_quantity, current_price, position['leverage'], position['side'], pnl=pnl)
+            self.db.add_trade(
+                self.model_id, coin, 'reduce_position', actual_closed_quantity, fill_price,
+                position['leverage'], position['side'], pnl=pnl, gross_pnl=gross_pnl, fee=allocated_entry_fee + close_fee
+            )
             result_signal = 'reduce_position'
-            message = f'(OKX) Reduce {coin} by {actual_closed_quantity}, remaining {remaining_quantity}, P&L: ${pnl:.2f}'
+            message = f'(OKX) Reduce {coin} by {actual_closed_quantity}, remaining {remaining_quantity}, Net P&L: ${pnl:.2f}'
 
         return {
             'coin': coin,
@@ -857,6 +900,9 @@ class ExecutionService:
         avg_price = actual_position.get('avg_price', current_price) if actual_position else current_price
         effective_stop_loss = stop_loss if stop_loss is not None else db_pos.get('stop_loss')
         effective_take_profit = take_profit if take_profit is not None else db_pos.get('take_profit')
+        import config
+        order_status = self.okx_trader.get_order_status(okx_result.get('ord_id'), config.OKX_SYMBOLS[coin])
+        _, entry_fee, _ = self._extract_order_fill_details(order_status, avg_price)
         risk_sync = self._sync_okx_native_risk_order(
             coin, side='long', contracts=total_contracts,
             stop_loss=effective_stop_loss, take_profit=effective_take_profit, db_pos=db_pos
@@ -865,6 +911,7 @@ class ExecutionService:
             self.model_id, coin, total_quantity, avg_price, leverage, 'long',
             effective_stop_loss, effective_take_profit,
             entry_ord_id=okx_result.get('ord_id'),
+            entry_fee=float(db_pos.get('entry_fee', 0) or 0) + entry_fee,
             okx_risk_algo_id=risk_sync.get('algo_id'),
             okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
             trailing_tier=0,
@@ -872,7 +919,7 @@ class ExecutionService:
             peak_profit_pct=float(db_pos.get('peak_profit_pct') or 0),
             last_profit_pct=float(db_pos.get('last_profit_pct') or 0)
         )
-        self.db.add_trade(self.model_id, coin, 'increase_position', quantity, current_price, leverage, 'long', pnl=0)
+        self.db.add_trade(self.model_id, coin, 'increase_position', quantity, current_price, leverage, 'long', pnl=0, gross_pnl=0, fee=entry_fee)
         return {
             'coin': coin,
             'signal': 'increase_position',

@@ -546,7 +546,11 @@ class TradingApp {
                 'hold': { badge: '', text: '持有' }
             };
             const signal = signalMap[trade.signal] || { badge: '', text: trade.action_text || trade.signal };
-            const pnlClass = trade.pnl > 0 ? 'text-success' : trade.pnl < 0 ? 'text-danger' : '';
+            const netPnl = trade.net_pnl ?? trade.pnl ?? 0;
+            const grossPnl = trade.gross_pnl ?? trade.pnl ?? 0;
+            const fee = trade.fee ?? 0;
+            const pnlClass = netPnl > 0 ? 'text-success' : netPnl < 0 ? 'text-danger' : '';
+            const pnlTitle = `毛盈亏: $${grossPnl.toFixed(2)}\n手续费: $${fee.toFixed(2)}\n净盈亏: $${netPnl.toFixed(2)}`;
 
             return `
                 <tr>
@@ -555,7 +559,7 @@ class TradingApp {
                     <td><span class="badge ${signal.badge}">${signal.text}</span></td>
                     <td>${trade.quantity.toFixed(4)}</td>
                     <td>$${trade.price.toFixed(2)}</td>
-                    <td class="${pnlClass}">$${trade.pnl.toFixed(2)}</td>
+                    <td class="${pnlClass}" title="${pnlTitle}">$${netPnl.toFixed(2)}</td>
                 </tr>
             `;
         }).join('');

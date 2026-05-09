@@ -50,7 +50,13 @@ APP_VERSION = str(int(time.time()))
 # 添加全局模板变量
 @app.context_processor
 def inject_version():
-    return {'app_version': APP_VERSION}
+    return {
+        'app_version': APP_VERSION,
+        'app_config': {
+            'market_refresh_interval': config.MARKET_REFRESH_INTERVAL,
+            'portfolio_refresh_interval': config.PORTFOLIO_REFRESH_INTERVAL,
+        }
+    }
 
 
 def map_signal_to_text(signal: str) -> str:

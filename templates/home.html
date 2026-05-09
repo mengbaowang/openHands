@@ -178,6 +178,9 @@
         </div>
     </footer>
 
+    <script>
+        window.APP_CONFIG = {{ app_config|tojson }};
+    </script>
     <script src="/static/home.js?v={{ app_version }}"></script>
 </body>
 </html>

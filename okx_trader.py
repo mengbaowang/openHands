@@ -1,13 +1,19 @@
 """OKX API 封装，负责余额、持仓、下单以及原生止盈止损管理。"""
 from okx import Account, Trade, MarketData
+import copy
 import config
 import time
 import requests
+import threading
 import uuid
 import json
 
 class OKXTrader:
     """OKX 模拟盘交易器"""
+
+    BALANCE_CACHE_TTL_SECONDS = 8
+    POSITIONS_CACHE_TTL_SECONDS = 5
+    STALE_PRIVATE_DATA_MAX_AGE_SECONDS = 180
 
     TRANSIENT_ERROR_KEYWORDS = (
         'temporarily unavailable',
@@ -37,8 +43,13 @@ class OKXTrader:
             config.OKX_FLAG
         )
         self.market_api = MarketData.MarketAPI(flag=config.OKX_FLAG)
+        self.account_api.timeout = 10.0
+        self.trade_api.timeout = 10.0
+        self.market_api.timeout = 10.0
         self._instrument_cache = {}
         self._debug_timestamps = {}
+        self._runtime_cache = {}
+        self._cache_lock = threading.Lock()
         
         # 设置超时（如果 SDK 支持）
         try:
@@ -56,6 +67,52 @@ class OKXTrader:
         if now - last_logged >= interval_seconds:
             self._debug_timestamps[key] = now
             print(message)
+
+    def _format_exception(self, exc: Exception) -> str:
+        message = str(exc).strip()
+        if message:
+            return message
+        return repr(exc) or exc.__class__.__name__
+
+    def _get_cached_runtime_value(self, key: str, ttl_seconds: int, force_refresh: bool = False):
+        if force_refresh:
+            return None
+
+        with self._cache_lock:
+            cached = self._runtime_cache.get(key)
+            if not cached:
+                return None
+
+            age = time.time() - cached['timestamp']
+            if age > ttl_seconds:
+                return None
+
+            return copy.deepcopy(cached['value'])
+
+    def _get_stale_runtime_value(self, key: str):
+        with self._cache_lock:
+            cached = self._runtime_cache.get(key)
+            if not cached:
+                return None, None
+
+            age = time.time() - cached['timestamp']
+            if age > self.STALE_PRIVATE_DATA_MAX_AGE_SECONDS:
+                return None, None
+
+            return copy.deepcopy(cached['value']), age
+
+    def _store_cached_runtime_value(self, key: str, value) -> None:
+        with self._cache_lock:
+            self._runtime_cache[key] = {
+                'timestamp': time.time(),
+                'value': copy.deepcopy(value)
+            }
+
+    def _invalidate_private_runtime_cache(self, *keys: str) -> None:
+        keys = keys or ('balance', 'positions')
+        with self._cache_lock:
+            for key in keys:
+                self._runtime_cache.pop(key, None)
 
     def get_contract_face_value(self, coin: str) -> float:
         """获取合约面值，单位为基础币"""
@@ -126,12 +183,21 @@ class OKXTrader:
         """将合约数量转换为USDT价值"""
         return self.contracts_to_coin_quantity(coin, contracts, price) * float(price)
 
-    def get_balance(self) -> dict:
+    def get_balance(self, force_refresh: bool = False, allow_stale: bool = False) -> dict:
         """
         获取账户余额
         添加重试机制，提高 API 调用稳定性
         """
+        cached_value = self._get_cached_runtime_value(
+            'balance',
+            self.BALANCE_CACHE_TTL_SECONDS,
+            force_refresh=force_refresh
+        )
+        if cached_value is not None:
+            return cached_value
+
         max_retries = 3
+        last_error = ''
         retry_delay = 2  # 秒
         #设置延迟
         for attempt in range(max_retries):
@@ -140,13 +206,15 @@ class OKXTrader:
                 if not isinstance(result, dict):
                     raise ValueError(f'余额响应类型异常: {type(result)}')
                 if result.get('code') != '0':
-                    error_msg = result.get('msg')
+                    api_code = result.get('code')
+                    error_msg = (result.get('msg') or '').strip() or f'OKX API error code={api_code}'
+                    last_error = error_msg
                     print(f"[ERROR] API 返回错误: {error_msg}")
                     if attempt < max_retries - 1 and error_msg and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
                         print(f"[ERROR] 暂时不可用，{retry_delay}秒后重试...")
                         time.sleep(retry_delay)
                         continue
-                    return {'error': error_msg}
+                    break
 
                 # 提取所有币种的余额
                 details = result.get('data', [])[0].get('details', [])
@@ -186,6 +254,7 @@ class OKXTrader:
                 }
                 # 打印格式化的余额信息
                 self._debug_log('balance_summary', f"[DEBUG] 获取余额成功: 总余额={total}, 币种数={len(balances)}")
+                self._store_cached_runtime_value('balance', result)
                 for ccy, balance in balances.items():
                     total_balance = balance['total'] - balance['frozen']
                     available_balance =total_balance-balance['frozen']
@@ -195,18 +264,43 @@ class OKXTrader:
                     )
                 return result
             except Exception as e:
-                error_msg = str(e)
+                error_msg = self._format_exception(e)
+                last_error = error_msg
                 print(f"[ERROR] 获取余额异常: {error_msg}")
                 if attempt < max_retries - 1 and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
                     print(f"[ERROR] 网络异常，{retry_delay}秒后重试...")
                     time.sleep(retry_delay)
                     continue
-                return {'error': error_msg}
+                break
 
-    def get_positions(self) -> list:
+        if allow_stale:
+            stale_value, age = self._get_stale_runtime_value('balance')
+            if stale_value is not None:
+                stale_value['_stale'] = True
+                stale_value['_stale_reason'] = last_error
+                stale_value['_stale_age_seconds'] = round(age, 1)
+                self._debug_log(
+                    'balance_stale_fallback',
+                    f"[WARN] OKX balance fallback to cached snapshot from {age:.1f}s ago: {last_error}",
+                    interval_seconds=30
+                )
+                return stale_value
+
+        return {'error': last_error or 'Unknown balance error'}
+
+    def get_positions(self, force_refresh: bool = False, allow_stale: bool = False) -> list:
         """获取持仓信息"""
+        cached_value = self._get_cached_runtime_value(
+            'positions',
+            self.POSITIONS_CACHE_TTL_SECONDS,
+            force_refresh=force_refresh
+        )
+        if cached_value is not None:
+            return cached_value
+
         max_retries = 3
         retry_delay = 2
+        last_error = ''
         for attempt in range(max_retries):
             try:
             # 查询账户配置
@@ -260,15 +354,29 @@ class OKXTrader:
                         f'final_position:{pos["inst_id"]}:{idx}',
                         f"[DEBUG] 最终持仓 #{idx}: instId={pos['inst_id']}, pos={pos['size']}"
                     )
+                self._store_cached_runtime_value('positions', all_positions)
                 return all_positions
             except Exception as e:
-                error_msg = str(e)
+                error_msg = self._format_exception(e)
+                last_error = error_msg
                 print(f"[ERROR] 获取持仓信息失败: {error_msg}")
                 if attempt < max_retries - 1 and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
                     print(f"[ERROR] 持仓接口异常，{retry_delay}秒后重试...")
                     time.sleep(retry_delay)
                     continue
-                return []
+                break
+
+        if allow_stale:
+            stale_value, age = self._get_stale_runtime_value('positions')
+            if stale_value is not None:
+                self._debug_log(
+                    'positions_stale_fallback',
+                    f"[WARN] OKX positions fallback to cached snapshot from {age:.1f}s ago: {last_error}",
+                    interval_seconds=30
+                )
+                return stale_value
+
+        return []
 
     def get_order_status(self, ord_id: str, inst_id: str) -> dict:
         """查询订单状态"""
@@ -465,6 +573,7 @@ class OKXTrader:
                     'error': result.get('msg')
                 }
 
+            self._invalidate_private_runtime_cache('balance', 'positions')
             return {
                 'success': True,
                 'ord_id': result.get('data', [{}])[0].get('ordId'),
@@ -506,6 +615,7 @@ class OKXTrader:
                 result = self.trade_api.place_order(**params)
                 if result.get('code') != '0':
                     return {'success': False, 'error': result.get('msg')}
+                self._invalidate_private_runtime_cache('balance', 'positions')
                 return {
                     'success': True,
                     'ord_id': result.get('data', [{}])[0].get('ordId'),
@@ -539,6 +649,7 @@ class OKXTrader:
                         result = self.trade_api.place_order(**params)
                         if result.get('code') != '0':
                             return {'success': False, 'error': result.get('msg')}
+                        self._invalidate_private_runtime_cache('balance', 'positions')
                         return {
                             'success': True,
                             'ord_id': result.get('data', [{}])[0].get('ordId'),

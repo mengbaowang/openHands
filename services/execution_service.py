@@ -30,7 +30,10 @@ class ExecutionService:
         self.model_id = model_id
         self.db = db
         self._debug_callback = debug_log
-        self.okx_trader = OKXTrader()
+        if hasattr(db, 'get_okx_trader'):
+            self.okx_trader = db.get_okx_trader()
+        else:
+            self.okx_trader = OKXTrader()
         self.peak_profit_activation_pct = PEAK_PROFIT_ACTIVATION_PCT
         self.peak_drawdown_close_ratio = PEAK_DRAWDOWN_CLOSE_RATIO
 
@@ -49,7 +52,7 @@ class ExecutionService:
         return self._execute_decisions_okx(decisions, market_state, portfolio)
 
     def record_account_value(self, portfolio: Dict) -> None:
-        balance = self.okx_trader.get_balance()
+        balance = self.okx_trader.get_balance(allow_stale=True)
         self.db.record_account_value(
             self.model_id,
             portfolio['total_value'],
@@ -323,7 +326,7 @@ class ExecutionService:
             raise ValueError(f"Leverage must be between {config.MIN_LEVERAGE} and {config.MAX_LEVERAGE}, got {leverage}")
 
     def _get_okx_portfolio(self, current_prices: Dict) -> Dict:
-        balance = self.okx_trader.get_balance()
+        balance = self.okx_trader.get_balance(allow_stale=True)
         if 'error' in balance:
             self._debug_log(f"获取余额失败，降级使用默认账户: {balance['error']}")
             balance = {'total': 10000, 'available': 10000, 'frozen': 0, 'details': []}
@@ -341,7 +344,7 @@ class ExecutionService:
                 usdt_available = float(item.get('availEq', 0))
                 frozen_margin = float(item.get('frozenBal', 0))
 
-        positions = self.okx_trader.get_positions()
+        positions = self.okx_trader.get_positions(allow_stale=True)
         if isinstance(positions, dict) and 'error' in positions:
             positions = []
 

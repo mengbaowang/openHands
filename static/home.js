@@ -2,8 +2,9 @@
 // AI Trading Platform - Home Page
 class TradingDashboard {
     constructor() {
+        const appConfig = window.APP_CONFIG || {};
         this.chart = null;
-        this.refreshInterval = 5000; // 5秒刷新一次
+        this.refreshInterval = Number(appConfig.market_refresh_interval) || 5000; // 5秒刷新一次
         this.darkMode = false; // 默认白天模式
         this.currentTimeFilter = 'all'; // 当前时间筛选：1d, 1w, 1m, 3m, all
         this.init();

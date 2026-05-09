@@ -701,7 +701,7 @@ class Database:
         
         try:
             # 获取账户余额
-            balance_data = okx_trader.get_balance()
+            balance_data = okx_trader.get_balance(allow_stale=True)
             if not balance_data or 'error' in balance_data:
                 print(f"[WARN] OKX 账户余额获取失败: {balance_data.get('error', '未知错误')}")
                 return {'cash': 0, 'positions': [], 'total_value': 0, 'positions_value': 0, 'realized_pnl': 0, 'unrealized_pnl': 0, 'frozen_margin': 0, 'wallet_balances': {}}
@@ -740,7 +740,7 @@ class Database:
             # print(f"[DEBUG] 已用保证金: {frozen_margin:.2f} USDT")
             
             # 3. 获取合约持仓
-            positions_data = okx_trader.get_positions()
+            positions_data = okx_trader.get_positions(allow_stale=True)
             if 'error' in positions_data:
                 positions_data = []
             

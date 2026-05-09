@@ -335,6 +335,9 @@
     </div>
 
 
+    <script>
+        window.APP_CONFIG = {{ app_config|tojson }};
+    </script>
     <script src="/static/app.js?v={{ app_version }}"></script>
 </body>
 </html>

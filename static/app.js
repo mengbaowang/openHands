@@ -1,12 +1,15 @@
 /* 仪表盘前端逻辑：模型管理、图表、持仓和交易展示。 */
 class TradingApp {
     constructor() {
+        const appConfig = window.APP_CONFIG || {};
         this.currentModelId = null;
         this.currentUser = null;
         this.chart = null;
         this.klineChart = null;
         this.currentKlineCoin = 'BTC';
         this.klineColorMode = 'red-up'; // 默认红涨绿跌
+        this.marketRefreshInterval = Number(appConfig.market_refresh_interval) || 5000;
+        this.portfolioRefreshInterval = Number(appConfig.portfolio_refresh_interval) || 10000;
         this.trades = [];
         this.tradeFilters = {
             coin: '',
@@ -945,13 +948,13 @@ class TradingApp {
     startRefreshCycles() {
         this.refreshIntervals.market = setInterval(() => {
             this.loadMarketPrices();
-        }, 5000);
+        }, this.marketRefreshInterval);
 
         this.refreshIntervals.portfolio = setInterval(() => {
             if (this.currentModelId) {
                 this.loadModelData();
             }
-        }, 10000);
+        }, this.portfolioRefreshInterval);
     }
 
     stopRefreshCycles() {

@@ -328,7 +328,7 @@ def add_model():
     try:
         from services.exchanges.okx_adapter import OKXTrader
         okx_trader = OKXTrader()
-        balance_data = okx_trader.get_balance()
+        balance_data = okx_trader.get_balance(allow_stale=True)
         if balance_data and 'error' not in balance_data:
             balances = balance_data.get('balances', {})
             initial_capital = 0.0

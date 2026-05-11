@@ -83,7 +83,7 @@ class ExecutionService:
         if not open_rows:
             return
 
-        okx_positions = self.okx_trader.get_positions() or []
+        okx_positions = self.okx_trader.get_positions(allow_stale=True) or []
         active_keys = {(pos['coin'], pos['side']) for pos in okx_positions if pos}
 
         for row in open_rows:
@@ -91,25 +91,45 @@ class ExecutionService:
             if key in active_keys:
                 continue
 
-            closed_snapshot = self.okx_trader.get_recent_closed_position(row['coin'], row['side'])
+            after_ms = None
+            try:
+                from datetime import datetime, timezone
+                if row.get('updated_at'):
+                    after_ms = int(datetime.strptime(row['updated_at'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc).timestamp() * 1000)
+            except Exception:
+                after_ms = None
+
+            closed_snapshot = self.okx_trader.get_recent_closed_position(row['coin'], row['side'], after_ms=after_ms)
+            if not closed_snapshot:
+                self._debug_log(
+                    f"reconcile_pending:{row['coin']}:{row['side']}",
+                    f"[WARN] {row['coin']} {row['side']} 在 OKX 中未找到足够新的平仓快照，跳过本轮对账，避免误判。"
+                )
+                continue
+
             close_price = float(closed_snapshot.get('closeAvgPx', 0) or 0)
-            current_price = close_price or current_prices.get(row['coin'], row['avg_price'])
-            quantity = float(row['quantity'])
-            leverage = int(row['leverage'])
-            fee = abs(float(closed_snapshot.get('fee', 0) or 0)) if closed_snapshot else 0.0
-            if closed_snapshot and closed_snapshot.get('realizedPnl') not in (None, ''):
-                pnl = float(closed_snapshot.get('realizedPnl', 0) or 0)
-                gross_pnl = pnl + fee
-            else:
-                if row['side'] == 'long':
-                    gross_pnl = (current_price - row['avg_price']) * quantity
-                else:
-                    gross_pnl = (row['avg_price'] - current_price) * quantity
-                pnl = gross_pnl - fee
+            realized_pnl = closed_snapshot.get('realizedPnl')
+            gross_raw = closed_snapshot.get('pnl')
+            if close_price <= 0 or realized_pnl in (None, ''):
+                self._debug_log(
+                    f"reconcile_incomplete:{row['coin']}:{row['side']}",
+                    f"[WARN] {row['coin']} {row['side']} 平仓快照不完整(closeAvgPx/realizedPnl 缺失)，跳过本轮对账。"
+                )
+                continue
+
+            close_contracts = float(closed_snapshot.get('closeTotalPos', 0) or 0)
+            quantity = self.okx_trader.contracts_to_coin_quantity(row['coin'], close_contracts, close_price) if close_contracts > 0 else float(row['quantity'])
+            leverage = int(float(closed_snapshot.get('lever', row['leverage']) or row['leverage']))
+            fee = abs(float(closed_snapshot.get('fee', 0) or 0))
+            funding_fee = abs(float(closed_snapshot.get('fundingFee', 0) or 0))
+            fee_total = fee + funding_fee
+
+            pnl = float(realized_pnl)
+            gross_pnl = float(gross_raw) if gross_raw not in (None, '') else pnl + fee_total
 
             trade_signal = 'sell_to_close' if row['side'] == 'long' else 'buy_to_close'
             self._debug_log(
-                f"对账发现 {row['coin']} {row['side']} 已在 OKX 平仓，自动补记交易记录，价格 {current_price:.4f}"
+                f"对账发现 {row['coin']} {row['side']} 已在 OKX 平仓，自动补记交易记录，价格 {close_price:.4f}"
             )
             timestamp = None
             if closed_snapshot and closed_snapshot.get('uTime'):
@@ -125,12 +145,12 @@ class ExecutionService:
                 row['coin'],
                 trade_signal,
                 quantity,
-                current_price,
+                close_price,
                 leverage,
                 row['side'],
                 pnl=pnl,
                 gross_pnl=gross_pnl,
-                fee=fee,
+                fee=fee_total,
                 timestamp=timestamp
             )
             self.db.close_position(self.model_id, row['coin'], row['side'])
@@ -631,11 +651,11 @@ class ExecutionService:
         self._validate_leverage(leverage)
         stop_loss, take_profit = self._resolve_risk_targets('long', current_price, stop_loss, take_profit)
 
-        for pos in self.okx_trader.get_positions():
+        for pos in self.okx_trader.get_positions(allow_stale=True):
             if pos['coin'] == coin:
                 return {'coin': coin, 'error': f'OKX 已有 {coin} 合约持仓'}
 
-        balance = self.okx_trader.get_balance()
+        balance = self.okx_trader.get_balance(allow_stale=True)
         if 'error' in balance:
             return {'coin': coin, 'error': f'Failed to get balance: {balance["error"]}'}
         required_margin = (quantity * current_price) / leverage
@@ -693,11 +713,11 @@ class ExecutionService:
         self._validate_leverage(leverage)
         stop_loss, take_profit = self._resolve_risk_targets('short', current_price, stop_loss, take_profit)
 
-        for pos in self.okx_trader.get_positions():
+        for pos in self.okx_trader.get_positions(allow_stale=True):
             if pos['coin'] == coin:
                 return {'coin': coin, 'error': f'OKX 已有 {coin} 合约持仓'}
 
-        balance = self.okx_trader.get_balance()
+        balance = self.okx_trader.get_balance(allow_stale=True)
         if 'error' in balance:
             return {'coin': coin, 'error': f'Failed to get balance: {balance["error"]}'}
         required_margin = (quantity * current_price) / leverage
@@ -746,7 +766,7 @@ class ExecutionService:
 
     def _execute_close_okx(self, coin: str, decision: Dict, market_state: Dict, portfolio: Dict, close_all: bool = True) -> Dict:
         position = None
-        positions = self.okx_trader.get_positions() or []
+        positions = self.okx_trader.get_positions(allow_stale=True) or []
         for pos in positions:
             if pos['coin'] == coin:
                 position = pos
@@ -844,7 +864,7 @@ class ExecutionService:
                                       retries: int = 5, delay_seconds: float = 0.5) -> Dict:
         last_position = None
         for attempt in range(retries):
-            positions = self.okx_trader.get_positions() or []
+            positions = self.okx_trader.get_positions(allow_stale=True) or []
             matching_position = None
             for pos in positions:
                 if pos['coin'] == coin and pos['side'] == side:
@@ -872,7 +892,7 @@ class ExecutionService:
         self._validate_quantity(quantity, coin)
         self._validate_leverage(leverage)
 
-        positions = self.okx_trader.get_positions() or []
+        positions = self.okx_trader.get_positions(allow_stale=True) or []
         existing_position = None
         for pos in positions:
             if pos['coin'] == coin:
@@ -884,7 +904,7 @@ class ExecutionService:
             return {'coin': coin, 'error': f'{coin} 已有空仓，不能做多加仓'}
 
         stop_loss, take_profit = self._resolve_risk_targets('long', current_price, stop_loss, take_profit)
-        balance = self.okx_trader.get_balance()
+        balance = self.okx_trader.get_balance(allow_stale=True)
         if 'error' in balance:
             return {'coin': coin, 'error': f'Failed to get balance: {balance["error"]}'}
         required_margin = (quantity * current_price) / leverage

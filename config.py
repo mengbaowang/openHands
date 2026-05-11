@@ -17,44 +17,24 @@ DATABASE_PATH = os.getenv('DATABASE_PATH', 'trading_bot.db')
 AUTO_TRADING = os.getenv('AUTO_TRADING', 'True').lower() == 'true'
 TRADING_INTERVAL = int(os.getenv('TRADING_INTERVAL', 180))  # 秒
 
-# 支持的币种列表（统一管理，遵循OCP原则）
-SUPPORTED_COINS = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE']
+# 支持的币种列表（仅 OKX）
+SUPPORTED_COINS = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ZEC']
 
-# Binance交易对映射
-BINANCE_SYMBOLS = {
-    'BTC': 'BTCUSDT',
-    'ETH': 'ETHUSDT',
-    'SOL': 'SOLUSDT',
-    'BNB': 'BNBUSDT',
-    'XRP': 'XRPUSDT',
-    'DOGE': 'DOGEUSDT'
-}
-
-# CoinGecko币种映射
-COINGECKO_MAPPING = {
-    'BTC': 'bitcoin',
-    'ETH': 'ethereum',
-    'SOL': 'solana',
-    'BNB': 'binancecoin',
-    'XRP': 'ripple',
-    'DOGE': 'dogecoin'
-}
-# OKX交易对映射（新增）
+# OKX交易对映射
 OKX_SYMBOLS = {
     'BTC': 'BTC-USDT-SWAP',  # 永续合约
     'ETH': 'ETH-USDT-SWAP',
     'SOL': 'SOL-USDT-SWAP',
     'BNB': 'BNB-USDT-SWAP',
     'XRP': 'XRP-USDT-SWAP',
-    'DOGE': 'DOGE-USDT-SWAP'
+    'DOGE': 'DOGE-USDT-SWAP',
+    'ZEC': 'ZEC-USDT-SWAP'
 }
 
 # 交易模式切换: okx_demo(OKX模拟盘) | okx_live(OKX实盘)
 TRADING_MODE = os.getenv('TRADING_MODE', 'okx_demo')
 # ============ 市场数据配置 ============
-MARKET_API_CACHE_DURATION = 5  # 秒
-BINANCE_API_URL = 'https://api.binance.com/api/v3'
-COINGECKO_API_URL = 'https://api.coingecko.com/api/v3'
+MARKET_API_CACHE_DURATION = 30  # 秒
 OKX_API_URL = 'https://www.okx.com/api/v5'
 
 
@@ -64,8 +44,8 @@ OKX_API_SECRET = os.getenv('OKX_API_SECRET', '4C4D384D0692A86ECA60F8EC01A47FB3')
 OKX_PASSPHRASE = os.getenv('OKX_PASSPHRASE', 'Mengbaowang666.')
 OKX_FLAG = '1' if TRADING_MODE == 'okx_demo' else '0'  # 1=模拟盘, 0=实盘
 # ============ 前端刷新频率 ============
-MARKET_REFRESH_INTERVAL = 5000  # 毫秒（修复了原来的错误35008）
-PORTFOLIO_REFRESH_INTERVAL = 10000  # 毫秒
+MARKET_REFRESH_INTERVAL = 15000  # 毫秒
+PORTFOLIO_REFRESH_INTERVAL = 30000  # 毫秒
 
 # ============ 风险管理配置 ============
 # 单笔交易最大风险比例

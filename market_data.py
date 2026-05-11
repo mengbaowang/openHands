@@ -1,635 +1,232 @@
 """行情获取、缓存管理与技术指标计算模块。"""
-import requests
-import time
 import json
 import os
+import time
 from typing import Dict, List, Optional
+
+import requests
+
 import config
 
+
 class MarketDataFetcher:
-    """Fetch real-time market data from multiple sources with fallback"""
+    """Fetch market data from OKX with cache fallback."""
 
     TIMEFRAME_CONFIG = {
-        '5m': {'binance': '5m', 'coincap': 'm5', 'cache_seconds': 300, 'points': 120},
-        '15m': {'binance': '15m', 'coincap': 'm15', 'cache_seconds': 900, 'points': 120},
-        '1h': {'binance': '1h', 'coincap': 'h1', 'cache_seconds': 3600, 'points': 240},
-        '4h': {'binance': '4h', 'coincap': 'h6', 'cache_seconds': 14400, 'points': 180},
-        '1d': {'binance': '1d', 'coincap': 'd1', 'cache_seconds': 21600, 'points': 90},
+        '5m': {'okx': '5m', 'cache_seconds': 300, 'points': 120},
+        '15m': {'okx': '15m', 'cache_seconds': 900, 'points': 120},
+        '1h': {'okx': '1H', 'cache_seconds': 3600, 'points': 240},
+        '4h': {'okx': '4H', 'cache_seconds': 14400, 'points': 180},
+        '1d': {'okx': '1Dutc', 'cache_seconds': 21600, 'points': 90},
     }
 
     def __init__(self):
-        # API URLs
-        self.binance_base_url = config.BINANCE_API_URL
-        self.coingecko_base_url = config.COINGECKO_API_URL
-        self.coincap_base_url = "https://api.coincap.io/v2"
-        self.cryptocompare_base_url = "https://min-api.cryptocompare.com/data"
-        self.okx_base_url = "https://www.okx.com/api/v5"
-
-        # Symbol mappings
-        self.binance_symbols = config.BINANCE_SYMBOLS
-        self.coingecko_mapping = config.COINGECKO_MAPPING
-        self.coincap_mapping = {
-            'BTC': 'bitcoin',
-            'ETH': 'ethereum',
-            'SOL': 'solana',
-            'BNB': 'binance-coin',
-            'XRP': 'xrp',
-            'DOGE': 'dogecoin'
-        }
+        self.okx_base_url = config.OKX_API_URL
         self.okx_symbols = {
             'BTC': 'BTC-USDT',
             'ETH': 'ETH-USDT',
             'SOL': 'SOL-USDT',
             'BNB': 'BNB-USDT',
             'XRP': 'XRP-USDT',
-            'DOGE': 'DOGE-USDT'
+            'DOGE': 'DOGE-USDT',
+            'ZEC': 'ZEC-USDT',
         }
-
-        # Cache settings
         self._cache = {}
         self._cache_time = {}
         self._cache_duration = config.MARKET_API_CACHE_DURATION
-        self._stale_cache_duration = 3600 * 24  # 过期缓存保留24小时
-
-        # 持久化缓存文件
         self._cache_file = 'market_data_cache.json'
         self._load_persistent_cache()
-
-        # Rate limiting (针对不同API设置不同的限流)
         self._last_request_time = {}
-        self._min_request_interval = {
-            'binance': 0.5,      # Binance很稳定，0.5秒即可
-            'coingecko': 10.0,   # CoinGecko免费版限流严重，10秒间隔
-            'coincap': 2.0,      # CoinCap中等限流
-            'cryptocompare': 2.0, # CryptoCompare中等限流
-            'okx': 1.0           # OKX中等限流
-        }
-    
+        self._min_request_interval = {'okx': 2.5}
+
     def _rate_limit(self, source: str):
-        """针对不同API的智能限流机制"""
         now = time.time()
         interval = self._min_request_interval.get(source, 2.0)
-
         if source in self._last_request_time:
             elapsed = now - self._last_request_time[source]
             if elapsed < interval:
-                sleep_time = interval - elapsed
-                # print(f"[DEBUG] Rate limiting {source}, sleeping {sleep_time:.1f}s")
-                time.sleep(sleep_time)
-
+                time.sleep(interval - elapsed)
         self._last_request_time[source] = time.time()
 
     def _load_persistent_cache(self):
-        """从文件加载持久化缓存"""
         try:
             if os.path.exists(self._cache_file):
                 with open(self._cache_file, 'r') as f:
                     data = json.load(f)
                     self._cache = data.get('cache', {})
                     self._cache_time = data.get('cache_time', {})
-                    print(f"[INFO] Loaded {len(self._cache)} cached items from {self._cache_file}")
-        except Exception as e:
-            print(f"[WARN] Failed to load persistent cache: {e}")
+        except Exception:
             self._cache = {}
             self._cache_time = {}
 
     def _save_persistent_cache(self):
-        """保存缓存到文件"""
         try:
-            data = {
-                'cache': self._cache,
-                'cache_time': self._cache_time
-            }
             with open(self._cache_file, 'w') as f:
-                json.dump(data, f)
-        except Exception as e:
-            print(f"[WARN] Failed to save persistent cache: {e}")
+                json.dump({'cache': self._cache, 'cache_time': self._cache_time}, f)
+        except Exception:
+            pass
 
     def get_current_prices(self, coins: List[str]) -> Dict[str, float]:
-        """Get current prices with multi-source fallback"""
-        # Check cache
         cache_key = 'prices_' + '_'.join(sorted(coins))
-        if cache_key in self._cache:
-            if time.time() - self._cache_time[cache_key] < self._cache_duration:
-                return self._cache[cache_key]
+        if cache_key in self._cache and time.time() - self._cache_time[cache_key] < self._cache_duration:
+            return self._cache[cache_key]
 
-        # 1. 优先使用 OKX 价格源
-        prices = None
-        if config.TRADING_MODE in {'okx_demo', 'okx_live'}:
-            prices = self._get_prices_from_okx(coins)
-            if prices and len(prices) == len(coins):
-                self._cache[cache_key] = prices
-                self._cache_time[cache_key] = time.time()
-                return prices
-        # 1. Try Binance (fastest, most reliable)
-        prices = self._get_prices_from_binance(coins)
+        prices = self._get_prices_from_okx(coins)
         if prices and len(prices) == len(coins):
             self._cache[cache_key] = prices
             self._cache_time[cache_key] = time.time()
             return prices
 
-        # 2. Try CoinGecko (comprehensive, but rate limited)
-        prices = self._get_prices_from_coingecko(coins)
-        if prices and len(prices) == len(coins):
-            self._cache[cache_key] = prices
-            self._cache_time[cache_key] = time.time()
-            return prices
+        if cache_key in self._cache and time.time() - self._cache_time[cache_key] < 2592000:
+            return self._cache[cache_key]
 
-        # 3. Try CoinCap (good free tier)
-        prices = self._get_prices_from_coincap(coins)
-        if prices and len(prices) == len(coins):
-            self._cache[cache_key] = prices
-            self._cache_time[cache_key] = time.time()
-            return prices
+        return {}
 
-        # 4. Try CryptoCompare (last resort)
-        prices = self._get_prices_from_cryptocompare(coins)
-        if prices and len(prices) == len(coins):
-            self._cache[cache_key] = prices
-            self._cache_time[cache_key] = time.time()
-            return prices
-
-        # All sources failed, return cached data if available (within 30 days - 只用真实数据)
-        if cache_key in self._cache:
-            cache_age = time.time() - self._cache_time[cache_key]
-            if cache_age < 2592000:  # 30天内的真实缓存数据都可以用
-                print(f"[WARN] All API sources failed, using cached real data ({cache_age/3600:.1f} hours old)")
-                return self._cache[cache_key]
-
-        # 禁止使用默认价格！返回空字典并记录错误
-        print(f"[ERROR] Failed to get current prices - NO MOCK DATA ALLOWED!")
-        print(f"[ERROR] All APIs failed and no cached data available. Please check network connection.")
-        return {}  # 返回空字典，让调用方处理
-
-    def _get_prices_from_binance(self, coins: List[str]) -> Optional[Dict[str, float]]:
-        """Fetch prices from Binance API"""
-        try:
-            self._rate_limit('binance')
-
-            symbols = [self.binance_symbols.get(coin) for coin in coins if coin in self.binance_symbols]
-            if not symbols:
-                return None
-
-            symbols_param = '[' + ','.join([f'"{s}"' for s in symbols]) + ']'
-
-            response = requests.get(
-                f"{self.binance_base_url}/ticker/24hr",
-                params={'symbols': symbols_param},
-                timeout=5
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            prices = {}
-            for item in data:
-                symbol = item['symbol']
-                for coin, binance_symbol in self.binance_symbols.items():
-                    if binance_symbol == symbol:
-                        prices[coin] = {
-                            'price': float(item['lastPrice']),
-                            'change_24h': float(item['priceChangePercent'])
-                        }
-                        break
-
-            return prices if prices else None
-
-        except Exception as e:
-            print(f"[WARN] Binance API failed: {e}")
-            return None
-    
-    def _get_prices_from_coingecko(self, coins: List[str]) -> Optional[Dict[str, float]]:
-        """Fetch prices from CoinGecko API"""
-        try:
-            self._rate_limit('coingecko')
-
-            coin_ids = [self.coingecko_mapping.get(coin, coin.lower()) for coin in coins]
-
-            response = requests.get(
-                f"{self.coingecko_base_url}/simple/price",
-                params={
-                    'ids': ','.join(coin_ids),
-                    'vs_currencies': 'usd',
-                    'include_24hr_change': 'true'
-                },
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            prices = {}
-            for coin in coins:
-                coin_id = self.coingecko_mapping.get(coin, coin.lower())
-                if coin_id in data:
-                    prices[coin] = {
-                        'price': data[coin_id]['usd'],
-                        'change_24h': data[coin_id].get('usd_24h_change', 0)
-                    }
-
-            return prices if prices else None
-
-        except Exception as e:
-            print(f"[WARN] CoinGecko API failed: {e}")
-            return None
-
-    def _get_prices_from_coincap(self, coins: List[str]) -> Optional[Dict[str, float]]:
-        """Fetch prices from CoinCap API (free tier: 4000 credits/month)"""
-        try:
-            self._rate_limit('coincap')
-
-            prices = {}
-            for coin in coins:
-                coin_id = self.coincap_mapping.get(coin, coin.lower())
-
-                response = requests.get(
-                    f"{self.coincap_base_url}/assets/{coin_id}",
-                    timeout=5
-                )
-                response.raise_for_status()
-                data = response.json()
-
-                if 'data' in data:
-                    asset = data['data']
-                    prices[coin] = {
-                        'price': float(asset['priceUsd']),
-                        'change_24h': float(asset.get('changePercent24Hr', 0))
-                    }
-
-            return prices if prices else None
-
-        except Exception as e:
-            print(f"[WARN] CoinCap API failed: {e}")
-            return None
-
-    def _get_prices_from_cryptocompare(self, coins: List[str]) -> Optional[Dict[str, float]]:
-        """Fetch prices from CryptoCompare API (free tier available)"""
-        try:
-            self._rate_limit('cryptocompare')
-
-            # CryptoCompare uses coin symbols directly
-            fsyms = ','.join(coins)
-
-            response = requests.get(
-                f"{self.cryptocompare_base_url}/pricemultifull",
-                params={
-                    'fsyms': fsyms,
-                    'tsyms': 'USD'
-                },
-                timeout=5
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            prices = {}
-            if 'RAW' in data:
-                for coin in coins:
-                    if coin in data['RAW'] and 'USD' in data['RAW'][coin]:
-                        coin_data = data['RAW'][coin]['USD']
-                        prices[coin] = {
-                            'price': float(coin_data['PRICE']),
-                            'change_24h': float(coin_data.get('CHANGEPCT24HOUR', 0))
-                        }
-
-            return prices if prices else None
-
-        except Exception as e:
-            print(f"[WARN] CryptoCompare API failed: {e}")
-            return None
-    
     def _get_prices_from_okx(self, coins: List[str]) -> Optional[Dict[str, float]]:
-        """从 OKX API 获取实时价格（优先使用）"""
         try:
             self._rate_limit('okx')
-            
-            # 获取所有产品的行情
-            inst_ids = [self.okx_symbols.get(coin) for coin in coins if coin in self.okx_symbols]
-            if not inst_ids:
-                return None
-            
-            # 查询多个产品行情
-            inst_type = 'SPOT'  # 现货
             response = requests.get(
                 f"{self.okx_base_url}/market/tickers",
-                params={
-                    'instType': inst_type,
-                    'instId': ','.join(inst_ids)
-                },
-                timeout=5
+                params={'instType': 'SWAP'},
+                timeout=8
             )
             response.raise_for_status()
             data = response.json()
-            
-            if data.get('code') != '0':
-                print(f"[WARN] OKX API error: {data.get('msg')}")
+            if data.get('code') != '0' or not data.get('data'):
                 return None
-            
+
+            ticker_map = {item.get('instId'): item for item in data.get('data', []) if item.get('instId')}
             prices = {}
-            for item in data.get('data', []):
-                inst_id = item.get('instId')
-                # 反向映射到币种
-                for coin, okx_symbol in self.okx_symbols.items():
-                    if okx_symbol == inst_id:
-                        prices[coin] = {
-                            'price': float(item.get('last', 0)),
-                            'change_24h': float(item.get('open24h', 0))
-                        }
-                        break
-            
+            for coin in coins:
+                inst_id = self.okx_symbols.get(coin)
+                item = ticker_map.get(inst_id)
+                if not item:
+                    continue
+                open_24h = float(item.get('open24h', 0) or 0)
+                last_price = float(item.get('last', 0) or 0)
+                change_24h = ((last_price - open_24h) / open_24h * 100) if open_24h > 0 else 0
+                prices[coin] = {'price': last_price, 'change_24h': change_24h}
             return prices if prices else None
-        except Exception as e:
-            print(f"[WARN] OKX API failed: {e}")
+        except Exception:
+            return None
+
+    def _get_historical_from_okx(self, coin: str, days: int) -> Optional[List[Dict]]:
+        try:
+            self._rate_limit('okx')
+            inst_id = self.okx_symbols.get(coin)
+            if not inst_id:
+                return None
+            bar = '1Dutc' if days > 7 else '1H'
+            limit = min(days if days > 7 else days * 24, 300)
+            response = requests.get(
+                f"{self.okx_base_url}/market/history-candles",
+                params={'instId': inst_id, 'bar': bar, 'limit': limit},
+                timeout=8
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get('code') != '0':
+                return None
+            return [{'timestamp': int(c[0]), 'price': float(c[4])} for c in reversed(data.get('data', []))]
+        except Exception:
+            return None
+
+    def _get_candles_from_okx(self, coin: str, timeframe: str, limit: int) -> Optional[List[Dict]]:
+        try:
+            self._rate_limit('okx')
+            inst_id = self.okx_symbols.get(coin)
+            tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
+            if not inst_id or not tf_config:
+                return None
+            response = requests.get(
+                f"{self.okx_base_url}/market/history-candles",
+                params={'instId': inst_id, 'bar': tf_config['okx'], 'limit': min(limit, 300)},
+                timeout=8
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get('code') != '0':
+                return None
+            return [
+                {
+                    'timestamp': int(c[0]),
+                    'open': float(c[1]),
+                    'high': float(c[2]),
+                    'low': float(c[3]),
+                    'close': float(c[4]),
+                    'price': float(c[4]),
+                    'volume': float(c[5]),
+                }
+                for c in reversed(data.get('data', []))
+            ]
+        except Exception:
             return None
 
     def get_market_data(self, coin: str) -> Dict:
-        """Get detailed market data from CoinGecko"""
-        coin_id = self.coingecko_mapping.get(coin, coin.lower())
-        
         try:
+            inst_id = self.okx_symbols.get(coin)
+            if not inst_id:
+                return {}
+            self._rate_limit('okx')
             response = requests.get(
-                f"{self.coingecko_base_url}/coins/{coin_id}",
-                params={'localization': 'false', 'tickers': 'false', 'community_data': 'false'},
-                timeout=10
+                f"{self.okx_base_url}/market/ticker",
+                params={'instId': inst_id},
+                timeout=8
             )
             response.raise_for_status()
             data = response.json()
-            
-            market_data = data.get('market_data', {})
-            
+            if data.get('code') != '0' or not data.get('data'):
+                return {}
+            ticker = data['data'][0]
             return {
-                'current_price': market_data.get('current_price', {}).get('usd', 0),
-                'market_cap': market_data.get('market_cap', {}).get('usd', 0),
-                'total_volume': market_data.get('total_volume', {}).get('usd', 0),
-                'price_change_24h': market_data.get('price_change_percentage_24h', 0),
-                'price_change_7d': market_data.get('price_change_percentage_7d', 0),
-                'high_24h': market_data.get('high_24h', {}).get('usd', 0),
-                'low_24h': market_data.get('low_24h', {}).get('usd', 0),
+                'current_price': float(ticker.get('last', 0)),
+                'market_cap': 0,
+                'total_volume': float(ticker.get('volCcy24h', 0)),
+                'price_change_24h': 0,
+                'price_change_7d': 0,
+                'high_24h': float(ticker.get('high24h', 0)),
+                'low_24h': float(ticker.get('low24h', 0)),
             }
-        except Exception as e:
-            print(f"[ERROR] Failed to get market data for {coin}: {e}")
+        except Exception:
             return {}
-    
+
     def get_historical_prices(self, coin: str, days: int = 7) -> List[Dict]:
-        """Get historical prices with multi-source fallback"""
-        # Check cache (延长缓存时间到6小时，减少API请求)
         cache_key = f'historical_{coin}_{days}'
-        if cache_key in self._cache:
-            cache_age = time.time() - self._cache_time[cache_key]
-            if cache_age < 21600:  # 6小时缓存（原来1小时太短）
-                return self._cache[cache_key]
-
-        # Try Binance first (最稳定，无限流)
-        prices = self._get_historical_from_binance(coin, days)
+        if cache_key in self._cache and time.time() - self._cache_time[cache_key] < 21600:
+            return self._cache[cache_key]
+        prices = self._get_historical_from_okx(coin, days)
         if prices:
             self._cache[cache_key] = prices
             self._cache_time[cache_key] = time.time()
-            self._save_persistent_cache()  # 保存到文件
+            self._save_persistent_cache()
             return prices
-
-        # Try CoinGecko as fallback
-        prices = self._get_historical_from_coingecko(coin, days)
-        if prices:
-            self._cache[cache_key] = prices
-            self._cache_time[cache_key] = time.time()
-            self._save_persistent_cache()  # 保存到文件
-            return prices
-
-        # Try CoinCap as fallback
-        prices = self._get_historical_from_coincap(coin, days)
-        if prices:
-            self._cache[cache_key] = prices
-            self._cache_time[cache_key] = time.time()
-            self._save_persistent_cache()  # 保存到文件
-            return prices
-
-        # Return cached data if available (within 30 days - 只用真实数据)
-        if cache_key in self._cache:
-            cache_age = time.time() - self._cache_time[cache_key]
-            if cache_age < 2592000:  # 30天内的真实缓存数据都可以用
-                print(f"[WARN] Historical data API failed, using cached real data for {coin} ({cache_age/3600:.1f} hours old)")
-                return self._cache[cache_key]
-
-        # 禁止使用模拟数据！返回空列表并记录错误
-        print(f"[ERROR] Failed to get historical prices for {coin} - NO MOCK DATA ALLOWED!")
-        print(f"[ERROR] All APIs failed and no cached data available. Please check network connection.")
-        return []  # 返回空列表，让调用方处理
+        if cache_key in self._cache and time.time() - self._cache_time[cache_key] < 2592000:
+            return self._cache[cache_key]
+        return []
 
     def get_historical_candles(self, coin: str, timeframe: str = '1h', limit: int = None) -> List[Dict]:
-        """Get OHLCV candles for a specific timeframe with caching and API fallback."""
         tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
         if not tf_config:
             raise ValueError(f'Unsupported timeframe: {timeframe}')
-
         candle_limit = limit or tf_config['points']
         cache_key = f'candles_{coin}_{timeframe}_{candle_limit}'
-        cache_ttl = tf_config['cache_seconds']
-        if cache_key in self._cache:
-            cache_age = time.time() - self._cache_time[cache_key]
-            if cache_age < cache_ttl:
-                return self._cache[cache_key]
-
-        candles = self._get_candles_from_binance(coin, timeframe, candle_limit)
+        if cache_key in self._cache and time.time() - self._cache_time[cache_key] < tf_config['cache_seconds']:
+            return self._cache[cache_key]
+        candles = self._get_candles_from_okx(coin, timeframe, candle_limit)
         if candles:
             self._cache[cache_key] = candles
             self._cache_time[cache_key] = time.time()
             self._save_persistent_cache()
             return candles
-
-        candles = self._get_candles_from_coincap(coin, timeframe, candle_limit)
-        if candles:
-            self._cache[cache_key] = candles
-            self._cache_time[cache_key] = time.time()
-            self._save_persistent_cache()
-            return candles
-
-        if cache_key in self._cache:
-            cache_age = time.time() - self._cache_time[cache_key]
-            if cache_age < 2592000:
-                print(f"[WARN] Candle API failed, using cached real data for {coin} {timeframe} ({cache_age/3600:.1f} hours old)")
-                return self._cache[cache_key]
-
-        print(f"[ERROR] Failed to get candles for {coin} {timeframe} - NO MOCK DATA ALLOWED!")
+        if cache_key in self._cache and time.time() - self._cache_time[cache_key] < 2592000:
+            return self._cache[cache_key]
         return []
 
-    def _get_historical_from_binance(self, coin: str, days: int) -> Optional[List[Dict]]:
-        """Fetch historical prices from Binance (最稳定的数据源)"""
-        try:
-            # Binance不需要rate limit，API很稳定
-            symbol = self.binance_symbols.get(coin)
-            if not symbol:
-                return None
-
-            # Binance Klines API
-            # interval: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
-            interval = '1d' if days > 7 else '1h'
-            limit = days if days > 7 else days * 24
-
-            response = requests.get(
-                f"{self.binance_base_url}/klines",
-                params={
-                    'symbol': symbol,
-                    'interval': interval,
-                    'limit': limit
-                },
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            prices = []
-            for kline in data:
-                # Binance kline format: [timestamp, open, high, low, close, volume, ...]
-                prices.append({
-                    'timestamp': kline[0],  # 开盘时间
-                    'price': float(kline[4])  # 收盘价
-                })
-
-            return prices if prices else None
-
-        except Exception as e:
-            print(f"[WARN] Binance historical data failed for {coin}: {e}")
-            return None
-
-    def _get_candles_from_binance(self, coin: str, timeframe: str, limit: int) -> Optional[List[Dict]]:
-        """Fetch OHLCV candles from Binance."""
-        try:
-            symbol = self.binance_symbols.get(coin)
-            if not symbol:
-                return None
-
-            tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
-            if not tf_config:
-                return None
-
-            response = requests.get(
-                f"{self.binance_base_url}/klines",
-                params={
-                    'symbol': symbol,
-                    'interval': tf_config['binance'],
-                    'limit': limit
-                },
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            candles = []
-            for kline in data:
-                candles.append({
-                    'timestamp': int(kline[0]),
-                    'open': float(kline[1]),
-                    'high': float(kline[2]),
-                    'low': float(kline[3]),
-                    'close': float(kline[4]),
-                    'price': float(kline[4]),
-                    'volume': float(kline[5]),
-                })
-            return candles if candles else None
-        except Exception as e:
-            print(f"[WARN] Binance candle data failed for {coin} {timeframe}: {e}")
-            return None
-
-    def _get_historical_from_coingecko(self, coin: str, days: int) -> Optional[List[Dict]]:
-        """Fetch historical prices from CoinGecko"""
-        try:
-            self._rate_limit('coingecko')
-
-            coin_id = self.coingecko_mapping.get(coin, coin.lower())
-
-            response = requests.get(
-                f"{self.coingecko_base_url}/coins/{coin_id}/market_chart",
-                params={'vs_currency': 'usd', 'days': days},
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            prices = []
-            for price_data in data.get('prices', []):
-                prices.append({
-                    'timestamp': price_data[0],
-                    'price': price_data[1]
-                })
-
-            return prices if prices else None
-
-        except Exception as e:
-            print(f"[WARN] CoinGecko historical data failed for {coin}: {e}")
-            return None
-
-    def _get_historical_from_coincap(self, coin: str, days: int) -> Optional[List[Dict]]:
-        """Fetch historical prices from CoinCap"""
-        try:
-            self._rate_limit('coincap')
-
-            coin_id = self.coincap_mapping.get(coin, coin.lower())
-
-            # CoinCap uses intervals: m1, m5, m15, m30, h1, h2, h6, h12, d1
-            interval = 'd1' if days > 7 else 'h1'
-
-            response = requests.get(
-                f"{self.coincap_base_url}/assets/{coin_id}/history",
-                params={
-                    'interval': interval
-                },
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            prices = []
-            if 'data' in data:
-                for item in data['data'][-days*24:]:  # 取最近的数据
-                    prices.append({
-                        'timestamp': item['time'],
-                        'price': float(item['priceUsd'])
-                    })
-
-            return prices if prices else None
-
-        except Exception as e:
-            print(f"[WARN] CoinCap historical data failed for {coin}: {e}")
-            return None
-
-    def _get_candles_from_coincap(self, coin: str, timeframe: str, limit: int) -> Optional[List[Dict]]:
-        """Fetch approximate candles from CoinCap history."""
-        try:
-            self._rate_limit('coincap')
-            coin_id = self.coincap_mapping.get(coin, coin.lower())
-            tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
-            if not tf_config:
-                return None
-
-            response = requests.get(
-                f"{self.coincap_base_url}/assets/{coin_id}/history",
-                params={'interval': tf_config['coincap']},
-                timeout=10
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            candles = []
-            for item in data.get('data', [])[-limit:]:
-                price = float(item['priceUsd'])
-                candles.append({
-                    'timestamp': item['time'],
-                    'open': price,
-                    'high': price,
-                    'low': price,
-                    'close': price,
-                    'price': price,
-                    'volume': float(item.get('volumeUsd24Hr') or 0),
-                })
-            return candles if candles else None
-        except Exception as e:
-            print(f"[WARN] CoinCap candle data failed for {coin} {timeframe}: {e}")
-            return None
-    
     def calculate_technical_indicators(self, coin: str) -> Dict:
-        """Calculate technical indicators"""
         candles = self.get_historical_candles(coin, timeframe='1h', limit=self.TIMEFRAME_CONFIG['1h']['points'])
         return self.calculate_technical_indicators_from_history(candles)
 
     def get_multi_timeframe_indicators(self, coin: str) -> Dict:
-        """Return indicators for the strategy timeframes used by the prompt."""
         result = {}
         for timeframe in ('1h', '15m', '5m'):
             candles = self.get_historical_candles(coin, timeframe=timeframe, limit=self.TIMEFRAME_CONFIG[timeframe]['points'])
@@ -637,8 +234,6 @@ class MarketDataFetcher:
         return result
 
     def calculate_technical_indicators_from_history(self, historical: List[Dict]) -> Dict:
-        """Calculate technical indicators from a provided historical window."""
-
         if not historical or len(historical) < 14:
             return {}
 
@@ -647,125 +242,77 @@ class MarketDataFetcher:
         lows = [float(p.get('low', p.get('close', p.get('price', 0)))) for p in historical]
         volumes = [float(p.get('volume', 0)) for p in historical]
 
-        # Simple Moving Average
         sma_5 = sum(prices[-5:]) / 5 if len(prices) >= 5 else prices[-1]
         sma_7 = sum(prices[-7:]) / 7 if len(prices) >= 7 else prices[-1]
         sma_14 = sum(prices[-14:]) / 14 if len(prices) >= 14 else prices[-1]
         sma_30 = sum(prices[-30:]) / 30 if len(prices) >= 30 else prices[-1]
 
-        # Exponential Moving Average
         ema_12 = self._calculate_ema(prices, 12)
         ema_26 = self._calculate_ema(prices, 26)
-
-        # MACD
         macd_line = ema_12 - ema_26
-        macd_series = []
-        for idx in range(len(prices)):
-            ema_12_i = self._calculate_ema(prices[:idx + 1], 12)
-            ema_26_i = self._calculate_ema(prices[:idx + 1], 26)
-            macd_series.append(ema_12_i - ema_26_i)
+        macd_series = [self._calculate_ema(prices[:idx + 1], 12) - self._calculate_ema(prices[:idx + 1], 26) for idx in range(len(prices))]
         signal_line = self._calculate_ema(macd_series, 9)
         macd_histogram = macd_line - signal_line
 
-        # RSI
-        changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        changes = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
         gains = [c if c > 0 else 0 for c in changes]
         losses = [-c if c < 0 else 0 for c in changes]
-
         avg_gain = sum(gains[-14:]) / 14 if gains else 0
         avg_loss = sum(losses[-14:]) / 14 if losses else 0
+        rsi = 100 if avg_loss == 0 else 100 - (100 / (1 + (avg_gain / avg_loss)))
 
-        if avg_loss == 0:
-            rsi = 100
-        else:
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
-
-        # Bollinger Bands
         sma_20 = sum(prices[-20:]) / 20 if len(prices) >= 20 else prices[-1]
         std_20 = self._calculate_std(prices[-20:]) if len(prices) >= 20 else 0
         bb_upper = sma_20 + (2 * std_20)
         bb_lower = sma_20 - (2 * std_20)
-
-        # 价格位置（在布林带中的位置）
         bb_position = ((prices[-1] - bb_lower) / (bb_upper - bb_lower)) if (bb_upper - bb_lower) > 0 else 0.5
 
         atr = self._calculate_atr(highs, lows, prices, 14)
-        avg_volume_20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else sum(volumes) / len(volumes) if volumes else 0
+        avg_volume_20 = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else (sum(volumes) / len(volumes) if volumes else 0)
         recent_volumes = volumes[-3:] if len(volumes) >= 3 else volumes
         volume_ratio = (volumes[-1] / avg_volume_20) if avg_volume_20 > 0 and volumes else 0
         recent_high = max(highs[-20:]) if len(highs) >= 20 else max(highs)
         recent_low = min(lows[-20:]) if len(lows) >= 20 else min(lows)
 
         return {
-            'sma_7': sma_7,
-            'sma_5': sma_5,
-            'sma_14': sma_14,
-            'sma_30': sma_30,
-            'ema_12': ema_12,
-            'ema_26': ema_26,
-            'macd': macd_line,
-            'macd_signal': signal_line,
-            'macd_histogram': macd_histogram,
-            'rsi_14': rsi,
-            'bb_upper': bb_upper,
-            'bb_middle': sma_20,
-            'bb_lower': bb_lower,
-            'bb_position': bb_position,
-            'current_price': prices[-1],
+            'sma_7': sma_7, 'sma_5': sma_5, 'sma_14': sma_14, 'sma_30': sma_30,
+            'ema_12': ema_12, 'ema_26': ema_26, 'macd': macd_line, 'macd_signal': signal_line,
+            'macd_histogram': macd_histogram, 'rsi_14': rsi, 'bb_upper': bb_upper, 'bb_middle': sma_20,
+            'bb_lower': bb_lower, 'bb_position': bb_position, 'current_price': prices[-1],
             'price_change_7d': ((prices[-1] - prices[0]) / prices[0]) * 100 if prices[0] > 0 else 0,
-            'volatility': std_20 / sma_20 if sma_20 > 0 else 0,
-            'atr_14': atr,
-            'volume': volumes[-1] if volumes else 0,
-            'volume_avg_20': avg_volume_20,
-            'volume_ratio': volume_ratio,
-            'recent_high_20': recent_high,
-            'recent_low_20': recent_low,
-            'close_prices_tail': prices[-5:],
+            'volatility': std_20 / sma_20 if sma_20 > 0 else 0, 'atr_14': atr, 'volume': volumes[-1] if volumes else 0,
+            'volume_avg_20': avg_volume_20, 'volume_ratio': volume_ratio, 'recent_high_20': recent_high,
+            'recent_low_20': recent_low, 'close_prices_tail': prices[-5:],
             'macd_histogram_tail': [value - signal_line for value in (macd_series[-5:] if len(macd_series) >= 5 else macd_series)],
             'volume_tail': recent_volumes,
         }
 
     def _calculate_ema(self, prices: List[float], period: int) -> float:
-        """计算指数移动平均"""
         if len(prices) < period:
             return prices[-1] if prices else 0
-
         multiplier = 2 / (period + 1)
         ema = sum(prices[:period]) / period
-
         for price in prices[period:]:
             ema = (price - ema) * multiplier + ema
-
         return ema
 
     def _calculate_std(self, prices: List[float]) -> float:
-        """计算标准差"""
         if not prices:
             return 0
-
         mean = sum(prices) / len(prices)
         variance = sum((p - mean) ** 2 for p in prices) / len(prices)
         return variance ** 0.5
 
     def _calculate_atr(self, highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
-        """Calculate ATR from OHLC data."""
         if not highs or not lows or not closes:
             return 0
-
         true_ranges = []
         for idx in range(1, len(closes)):
             high = highs[idx]
             low = lows[idx]
             prev_close = closes[idx - 1]
-            true_ranges.append(max(
-                high - low,
-                abs(high - prev_close),
-                abs(low - prev_close)
-            ))
-
+            true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
         if not true_ranges:
             return 0
-
         window = true_ranges[-period:] if len(true_ranges) >= period else true_ranges
         return sum(window) / len(window)

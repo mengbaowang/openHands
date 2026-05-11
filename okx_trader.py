@@ -1,29 +1,108 @@
 """OKX API 封装，负责余额、持仓、下单以及原生止盈止损管理。"""
-from okx import Account, Trade, MarketData
 import copy
-import config
-import time
-import requests
-import threading
-import uuid
 import json
+import threading
+import time
+import uuid
+
+import config
+import httpx
+import requests
+from datetime import datetime, timezone
+from okx import Account, MarketData, Trade
+from okx import consts as okx_consts
+from okx import utils as okx_utils
+from okx.okxclient import OkxClient as _OkxClient
+
+
+def _patch_okx_client_request() -> None:
+    """Ensure OKX SDK responses are closed so the HTTP pool does not get exhausted."""
+    if getattr(_OkxClient, '_codex_safe_request_patched', False):
+        return
+
+    def _safe_request(self, method, request_path, params):
+        if method == okx_consts.GET:
+            request_path = request_path + okx_utils.parse_params_to_str(params)
+        timestamp = okx_utils.get_timestamp()
+        if self.use_server_time:
+            timestamp = self._get_timestamp()
+        body = json.dumps(params) if method == okx_consts.POST else ""
+        if self.API_KEY != '-1':
+            sign = okx_utils.sign(
+                okx_utils.pre_hash(timestamp, method, request_path, str(body), self.debug),
+                self.API_SECRET_KEY
+            )
+            header = okx_utils.get_header(self.API_KEY, sign, timestamp, self.PASSPHRASE, self.flag, self.debug)
+        else:
+            header = okx_utils.get_header_no_sign(self.flag, self.debug)
+
+        response = None
+        try:
+            if self.debug is True:
+                from loguru import logger
+                logger.debug(f'domain: {self.domain}')
+                logger.debug(f'url: {request_path}')
+                logger.debug(f'body:{body}')
+
+            if method == okx_consts.GET:
+                response = self.get(request_path, headers=header)
+            elif method == okx_consts.POST:
+                response = self.post(request_path, data=body, headers=header)
+            else:
+                raise ValueError(f'Unsupported method: {method}')
+
+            return response.json()
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    def _safe_get_timestamp(self):
+        request_path = okx_consts.API_URL + okx_consts.SERVER_TIMESTAMP_URL
+        response = None
+        try:
+            response = self.get(request_path)
+            if response.status_code == 200:
+                ts = datetime.fromtimestamp(int(response.json()['data'][0]['ts']) / 1000.0, tz=timezone.utc)
+                return ts.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+            return ""
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
+
+    _OkxClient._request = _safe_request
+    _OkxClient._get_timestamp = _safe_get_timestamp
+    _OkxClient._codex_safe_request_patched = True
+
+
+_patch_okx_client_request()
 
 class OKXTrader:
     """OKX 模拟盘交易器"""
 
-    BALANCE_CACHE_TTL_SECONDS = 8
-    POSITIONS_CACHE_TTL_SECONDS = 5
+    BALANCE_CACHE_TTL_SECONDS = 20
+    POSITIONS_CACHE_TTL_SECONDS = 15
     STALE_PRIVATE_DATA_MAX_AGE_SECONDS = 180
 
     TRANSIENT_ERROR_KEYWORDS = (
         'temporarily unavailable',
         'connection',
         'timed out',
+        'pooltimeout',
         '10035',
         'Expecting value',
         'Remote end closed connection',
         'Connection aborted',
-        'Connection reset'
+        'Connection reset',
+        'SSLEOFError',
+        'SSL:',
+        'unexpected eof',
+        'remote host closed'
     )
 
     def __init__(self):
@@ -46,10 +125,14 @@ class OKXTrader:
         self.account_api.timeout = 10.0
         self.trade_api.timeout = 10.0
         self.market_api.timeout = 10.0
+        self._tune_http_client(self.account_api)
+        self._tune_http_client(self.trade_api)
+        self._tune_http_client(self.market_api)
         self._instrument_cache = {}
         self._debug_timestamps = {}
         self._runtime_cache = {}
         self._cache_lock = threading.Lock()
+        self._api_lock = threading.Lock()
         
         # 设置超时（如果 SDK 支持）
         try:
@@ -59,6 +142,33 @@ class OKXTrader:
                 pass
         except Exception as e:
             print(f"[INFO] 设置超时失败: {e}")
+
+    def _tune_http_client(self, client, max_connections: int = 20) -> None:
+        """Tune the SDK httpx client to reduce pool exhaustion and flaky keepalive reuse."""
+        try:
+            client.timeout = httpx.Timeout(30.0, connect=10.0, read=20.0, write=20.0, pool=30.0)
+        except Exception:
+            pass
+
+        try:
+            transport = getattr(client, '_transport', None)
+            pool = getattr(transport, '_pool', None) if transport is not None else None
+            if pool is None:
+                return
+
+            if hasattr(pool, '_http2'):
+                pool._http2 = False
+            if hasattr(pool, '_http1'):
+                pool._http1 = True
+            pool._max_connections = max(int(getattr(pool, '_max_connections', 0) or 0), max_connections)
+            pool._max_keepalive_connections = max(
+                int(getattr(pool, '_max_keepalive_connections', 0) or 0),
+                max(5, max_connections // 2)
+            )
+            if hasattr(pool, '_keepalive_expiry'):
+                pool._keepalive_expiry = min(float(getattr(pool, '_keepalive_expiry', 5.0) or 5.0), 5.0)
+        except Exception as e:
+            print(f"[WARN] 调整 OKX HTTP 客户端失败: {e}")
 
     def _debug_log(self, key: str, message: str, interval_seconds: int = 180) -> None:
         """调试日志记录器，避免频繁打印"""
@@ -200,78 +310,79 @@ class OKXTrader:
         last_error = ''
         retry_delay = 2  # 秒
         #设置延迟
-        for attempt in range(max_retries):
-            try:
-                result = self.account_api.get_account_balance()
-                if not isinstance(result, dict):
-                    raise ValueError(f'余额响应类型异常: {type(result)}')
-                if result.get('code') != '0':
-                    api_code = result.get('code')
-                    error_msg = (result.get('msg') or '').strip() or f'OKX API error code={api_code}'
+        with self._api_lock:
+            for attempt in range(max_retries):
+                try:
+                    result = self.account_api.get_account_balance()
+                    if not isinstance(result, dict):
+                        raise ValueError(f'余额响应类型异常: {type(result)}')
+                    if result.get('code') != '0':
+                        api_code = result.get('code')
+                        error_msg = (result.get('msg') or '').strip() or f'OKX API error code={api_code}'
+                        last_error = error_msg
+                        print(f"[ERROR] API 返回错误: {error_msg}")
+                        if attempt < max_retries - 1 and error_msg and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
+                            print(f"[ERROR] 暂时不可用，{retry_delay}秒后重试...")
+                            time.sleep(retry_delay)
+                            continue
+                        break
+
+                    # 提取所有币种的余额
+                    details = result.get('data', [])[0].get('details', [])
+                    balances = {}
+                    total = 0
+                    available = 0
+                    frozen = 0
+
+                    for item in details:
+                        ccy = item.get('ccy')
+                        if not ccy:
+                            continue
+
+                        cash_bal = float(item.get('cashBal', 0))
+                        frozen_bal = float(item.get('frozenBal', 0))
+                        total_bal = cash_bal + frozen_bal
+
+                        # 只记录有余额的币种
+                        if cash_bal > 0 or frozen_bal > 0:
+                            balances[ccy] = {
+                                'total': total_bal,
+                                'available': cash_bal,
+                                'frozen': frozen_bal
+                            }
+                        # 累计 USDT 余额（假设所有币种都已转换为 USDT）
+                        if ccy == 'USDT':
+                            total += total_bal
+                            available += cash_bal
+                            frozen += frozen_bal
+                    # 保持向后兼容，同时返回新的结构
+                    result = {
+                        'total': total,
+                        'available': available,
+                        'frozen': frozen,
+                        'balances': balances,
+                        'details': details  # 保留原始数据用于调试
+                    }
+                    # 打印格式化的余额信息
+                    self._debug_log('balance_summary', f"[DEBUG] 获取余额成功: 总余额={total}, 币种数={len(balances)}")
+                    self._store_cached_runtime_value('balance', result)
+                    for ccy, balance in balances.items():
+                        total_balance = balance['total'] - balance['frozen']
+                        available_balance =total_balance-balance['frozen']
+                        self._debug_log(
+                            f'balance_detail:{ccy}',
+                            f"[DEBUG] 币种：{ccy};总余额：{total_balance};已被占用余额：{balance['frozen']};可用余额：{available_balance}"
+                        )
+                    return result
+                except Exception as e:
+                    error_msg = self._format_exception(e)
                     last_error = error_msg
-                    print(f"[ERROR] API 返回错误: {error_msg}")
-                    if attempt < max_retries - 1 and error_msg and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
-                        print(f"[ERROR] 暂时不可用，{retry_delay}秒后重试...")
+                    print(f"[ERROR] 获取余额异常: {error_msg}")
+                    if attempt < max_retries - 1 and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
+                        print(f"[ERROR] 网络异常，{retry_delay}秒后重试...")
                         time.sleep(retry_delay)
                         continue
                     break
-
-                # 提取所有币种的余额
-                details = result.get('data', [])[0].get('details', [])
-                balances = {}
-                total = 0
-                available = 0
-                frozen = 0
-
-                for item in details:
-                    ccy = item.get('ccy')
-                    if not ccy:
-                        continue
-
-                    cash_bal = float(item.get('cashBal', 0))
-                    frozen_bal = float(item.get('frozenBal', 0))
-                    total_bal = cash_bal + frozen_bal
-
-                    # 只记录有余额的币种
-                    if cash_bal > 0 or frozen_bal > 0:
-                        balances[ccy] = {
-                            'total': total_bal,
-                            'available': cash_bal,
-                            'frozen': frozen_bal
-                        }
-                    # 累计 USDT 余额（假设所有币种都已转换为 USDT）
-                    if ccy == 'USDT':
-                        total += total_bal
-                        available += cash_bal
-                        frozen += frozen_bal
-                # 保持向后兼容，同时返回新的结构
-                result = {
-                    'total': total,
-                    'available': available,
-                    'frozen': frozen,
-                    'balances': balances,
-                    'details': details  # 保留原始数据用于调试
-                }
-                # 打印格式化的余额信息
-                self._debug_log('balance_summary', f"[DEBUG] 获取余额成功: 总余额={total}, 币种数={len(balances)}")
-                self._store_cached_runtime_value('balance', result)
-                for ccy, balance in balances.items():
-                    total_balance = balance['total'] - balance['frozen']
-                    available_balance =total_balance-balance['frozen']
-                    self._debug_log(
-                        f'balance_detail:{ccy}',
-                        f"[DEBUG] 币种：{ccy};总余额：{total_balance};已被占用余额：{balance['frozen']};可用余额：{available_balance}"
-                    )
-                return result
-            except Exception as e:
-                error_msg = self._format_exception(e)
-                last_error = error_msg
-                print(f"[ERROR] 获取余额异常: {error_msg}")
-                if attempt < max_retries - 1 and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
-                    print(f"[ERROR] 网络异常，{retry_delay}秒后重试...")
-                    time.sleep(retry_delay)
-                    continue
-                break
 
         if allow_stale:
             stale_value, age = self._get_stale_runtime_value('balance')
@@ -301,70 +412,71 @@ class OKXTrader:
         max_retries = 3
         retry_delay = 2
         last_error = ''
-        for attempt in range(max_retries):
-            try:
-            # 查询账户配置
+        with self._api_lock:
+            for attempt in range(max_retries):
                 try:
-                    config_result = self.account_api.get_account_config()
-                    if not isinstance(config_result, dict):
-                        raise ValueError(f'Unexpected account config response type: {type(config_result)}')
-                    if config_result.get('code') == '0' and config_result.get('data'):
-                        config_data = config_result.get('data', [{}])[0]
-                        self._debug_log(
-                            'account_config_summary',
-                            f"[DEBUG] 账户配置: posMode={config_data.get('posMode')}, acctLv={config_data.get('acctLv')}"
-                        )
-                except Exception as e:
-                    print(f"[ERROR] 查询账户配置失败: {e}")
+                # 查询账户配置
+                    try:
+                        config_result = self.account_api.get_account_config()
+                        if not isinstance(config_result, dict):
+                            raise ValueError(f'Unexpected account config response type: {type(config_result)}')
+                        if config_result.get('code') == '0' and config_result.get('data'):
+                            config_data = config_result.get('data', [{}])[0]
+                            self._debug_log(
+                                'account_config_summary',
+                                f"[DEBUG] 账户配置: posMode={config_data.get('posMode')}, acctLv={config_data.get('acctLv')}"
+                            )
+                    except Exception as e:
+                        print(f"[ERROR] 查询账户配置失败: {e}")
 
-                all_positions = []
-                inst_ids = list(config.OKX_SYMBOLS.values())
-                for inst_id in inst_ids:
-                    inst_result = self.account_api.get_positions(instId=inst_id)
-                    if not isinstance(inst_result, dict):
-                        raise ValueError(f'Unexpected positions response type: {type(inst_result)}')
-                    if inst_result.get('code') == '0':
-                        data = inst_result.get('data', [])
-                        if data:
-                            for pos in data:
-                                if float(pos.get('pos', 0)) != 0:
-                                    coin = pos.get('instId').split('-')[0]
-                                    contracts = float(pos.get('pos', 0))
-                                    avg_price = float(pos.get('avgPx', 0))
-                                    instrument = self.get_instrument_spec(pos.get('instId'))
-                                    all_positions.append({
-                                        'coin': coin,
-                                        'inst_id': pos.get('instId'),
-                                        'side': pos.get('posSide'),
-                                        'size': contracts,
-                                        'contracts': contracts,
-                                        'avg_price': avg_price,
-                                        'coin_quantity': self.contracts_to_coin_quantity(coin, contracts, avg_price),
-                                        'face_value': self.get_contract_face_value(coin),
-                                        'lot_size': float(instrument.get('lotSz', 1) or 1),
-                                        'min_size': float(instrument.get('minSz', 1) or 1),
-                                        'notional_usdt': self.contracts_to_notional_usdt(coin, contracts, avg_price),
-                                        'leverage': int(pos.get('lever', 1)),
-                                        'unrealized_pnl': float(pos.get('upl', 0)),
-                                        'mgnMode': pos.get('mgnMode', ''),
-                                        'posId': pos.get('posId', '')
-                                    })
-                for idx, pos in enumerate(all_positions):
-                    self._debug_log(
-                        f'final_position:{pos["inst_id"]}:{idx}',
-                        f"[DEBUG] 最终持仓 #{idx}: instId={pos['inst_id']}, pos={pos['size']}"
-                    )
-                self._store_cached_runtime_value('positions', all_positions)
-                return all_positions
-            except Exception as e:
-                error_msg = self._format_exception(e)
-                last_error = error_msg
-                print(f"[ERROR] 获取持仓信息失败: {error_msg}")
-                if attempt < max_retries - 1 and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
-                    print(f"[ERROR] 持仓接口异常，{retry_delay}秒后重试...")
-                    time.sleep(retry_delay)
-                    continue
-                break
+                    all_positions = []
+                    inst_ids = list(config.OKX_SYMBOLS.values())
+                    for inst_id in inst_ids:
+                        inst_result = self.account_api.get_positions(instId=inst_id)
+                        if not isinstance(inst_result, dict):
+                            raise ValueError(f'Unexpected positions response type: {type(inst_result)}')
+                        if inst_result.get('code') == '0':
+                            data = inst_result.get('data', [])
+                            if data:
+                                for pos in data:
+                                    if float(pos.get('pos', 0)) != 0:
+                                        coin = pos.get('instId').split('-')[0]
+                                        contracts = float(pos.get('pos', 0))
+                                        avg_price = float(pos.get('avgPx', 0))
+                                        instrument = self.get_instrument_spec(pos.get('instId'))
+                                        all_positions.append({
+                                            'coin': coin,
+                                            'inst_id': pos.get('instId'),
+                                            'side': pos.get('posSide'),
+                                            'size': contracts,
+                                            'contracts': contracts,
+                                            'avg_price': avg_price,
+                                            'coin_quantity': self.contracts_to_coin_quantity(coin, contracts, avg_price),
+                                            'face_value': self.get_contract_face_value(coin),
+                                            'lot_size': float(instrument.get('lotSz', 1) or 1),
+                                            'min_size': float(instrument.get('minSz', 1) or 1),
+                                            'notional_usdt': self.contracts_to_notional_usdt(coin, contracts, avg_price),
+                                            'leverage': int(pos.get('lever', 1)),
+                                            'unrealized_pnl': float(pos.get('upl', 0)),
+                                            'mgnMode': pos.get('mgnMode', ''),
+                                            'posId': pos.get('posId', '')
+                                        })
+                    for idx, pos in enumerate(all_positions):
+                        self._debug_log(
+                            f'final_position:{pos["inst_id"]}:{idx}',
+                            f"[DEBUG] 最终持仓 #{idx}: instId={pos['inst_id']}, pos={pos['size']}"
+                        )
+                    self._store_cached_runtime_value('positions', all_positions)
+                    return all_positions
+                except Exception as e:
+                    error_msg = self._format_exception(e)
+                    last_error = error_msg
+                    print(f"[ERROR] 获取持仓信息失败: {error_msg}")
+                    if attempt < max_retries - 1 and any(k.lower() in error_msg.lower() for k in self.TRANSIENT_ERROR_KEYWORDS):
+                        print(f"[ERROR] 持仓接口异常，{retry_delay}秒后重试...")
+                        time.sleep(retry_delay)
+                        continue
+                    break
 
         if allow_stale:
             stale_value, age = self._get_stale_runtime_value('positions')
@@ -381,10 +493,11 @@ class OKXTrader:
     def get_order_status(self, ord_id: str, inst_id: str) -> dict:
         """查询订单状态"""
         try:
-            result = self.trade_api.get_order(
-                instId=inst_id,
-                ordId=ord_id
-            )
+            with self._api_lock:
+                result = self.trade_api.get_order(
+                    instId=inst_id,
+                    ordId=ord_id
+                )
             print(f"[DEBUG] 查询订单状态 ord_id={ord_id}, inst_id={inst_id}")
             #print(f"[DEBUG] 订单状态返回: {result}")
             return result
@@ -430,11 +543,12 @@ class OKXTrader:
                     payload['slTriggerPxType'] = trigger_px_type
                 return payload
 
-            params = build_params(include_algo_cl_ord_id=True)
-            result = self.trade_api.place_algo_order(**params)
-            if result.get('code') != '0' and 'algoClOrdId' in (result.get('msg') or ''):
-                params = build_params(include_algo_cl_ord_id=False)
+            with self._api_lock:
+                params = build_params(include_algo_cl_ord_id=True)
                 result = self.trade_api.place_algo_order(**params)
+                if result.get('code') != '0' and 'algoClOrdId' in (result.get('msg') or ''):
+                    params = build_params(include_algo_cl_ord_id=False)
+                    result = self.trade_api.place_algo_order(**params)
 
             if result.get('code') != '0':
                 return {'success': False, 'error': result.get('msg'), 'raw': result}
@@ -476,7 +590,8 @@ class OKXTrader:
                 params['newSlOrdPx'] = '-1'
                 params['newSlTriggerPxType'] = trigger_px_type
 
-            result = self.trade_api.amend_algo_order(**params)
+            with self._api_lock:
+                result = self.trade_api.amend_algo_order(**params)
             if result.get('code') != '0':
                 return {'success': False, 'error': result.get('msg'), 'raw': result}
             return {'success': True, 'message': f'Native TP/SL amended for {coin}'}
@@ -497,7 +612,8 @@ class OKXTrader:
                 'algoId': algo_id or '',
                 'algoClOrdId': algo_cl_ord_id or ''
             }]
-            result = self.trade_api.cancel_algo_order(params)
+            with self._api_lock:
+                result = self.trade_api.cancel_algo_order(params)
             if result.get('code') == '1':
                 data = result.get('data', []) or []
                 for item in data:
@@ -540,13 +656,14 @@ class OKXTrader:
 
             # 设置杠杆
             if leverage > 1:
-                set_lever_result = self.account_api.set_leverage(
-                    instId=inst_id,
-                    lever=str(leverage),
-                    mgnMode='cross',  # 全仓
-                    posSide='long' if side == 'buy' else 'short',  # 开平仓模式
-                    ccy='USDT'
-                )
+                with self._api_lock:
+                    set_lever_result = self.account_api.set_leverage(
+                        instId=inst_id,
+                        lever=str(leverage),
+                        mgnMode='cross',  # 全仓
+                        posSide='long' if side == 'buy' else 'short',  # 开平仓模式
+                        ccy='USDT'
+                    )
                 print(f"[DEBUG] 设置杠杆结果: {set_lever_result}")
                 if set_lever_result.get('code') != '0':
                     print(f"[ERROR] Set leverage failed: {set_lever_result.get('msg')}")
@@ -563,7 +680,8 @@ class OKXTrader:
             }
             print(f"[DEBUG] 下单请求参数: {params}")
 
-            result = self.trade_api.place_order(**params)
+            with self._api_lock:
+                result = self.trade_api.place_order(**params)
             print(f"[DEBUG] 下单返回结果: {result}")
 
             if result.get('code') != '0':
@@ -612,7 +730,8 @@ class OKXTrader:
                     'ordType': 'market',
                     'sz': sz
                 }
-                result = self.trade_api.place_order(**params)
+                with self._api_lock:
+                    result = self.trade_api.place_order(**params)
                 if result.get('code') != '0':
                     return {'success': False, 'error': result.get('msg')}
                 self._invalidate_private_runtime_cache('balance', 'positions')
@@ -625,7 +744,8 @@ class OKXTrader:
             # 方式2：通过 instId 平仓（自动查询持仓数量）
             elif instId:
                 # 查询当前持仓
-                inst_result = self.account_api.get_positions(instId=instId)
+                with self._api_lock:
+                    inst_result = self.account_api.get_positions(instId=instId)
                 if inst_result.get('code') != '0':
                     return {'success': False, 'error': inst_result.get('msg')}
 
@@ -646,7 +766,8 @@ class OKXTrader:
                             'ordType': 'market',
                             'sz': str(size)
                         }
-                        result = self.trade_api.place_order(**params)
+                        with self._api_lock:
+                            result = self.trade_api.place_order(**params)
                         if result.get('code') != '0':
                             return {'success': False, 'error': result.get('msg')}
                         self._invalidate_private_runtime_cache('balance', 'positions')
@@ -667,7 +788,8 @@ class OKXTrader:
     def get_open_orders(self) -> list:
         """获取挂单"""
         try:
-            result = self.trade_api.get_order_list(instType='SWAP')
+            with self._api_lock:
+                result = self.trade_api.get_order_list(instType='SWAP')
             if result.get('code') != '0':
                 return []
             return result.get('data', [])
@@ -687,7 +809,8 @@ class OKXTrader:
     def get_account_config(self) -> dict:
         """查询账户配置"""
         try:
-            result = self.account_api.get_account_config()
+            with self._api_lock:
+                result = self.account_api.get_account_config()
             self._debug_log('account_config_raw', f"[DEBUG] 账户配置: {result}")
             if result.get('code') == '0' and result.get('data'):
                 config_data = result.get('data', [{}])[0]
@@ -706,19 +829,38 @@ class OKXTrader:
             print(f"[ERROR] Get account config failed: {e}")
             return {'success': False, 'error': str(e)}
 
-    def get_recent_closed_position(self, coin: str, side: str) -> dict:
-        """获取最近平仓持仓"""
+    def get_recent_closed_position(self, coin: str, side: str, after_ms: int = None) -> dict:
+        """获取最近平仓持仓，优先返回晚于 after_ms 的最新一条。"""
         try:
-            result = self.account_api.get_positions_history(instType='SWAP')
+            with self._api_lock:
+                result = self.account_api.get_positions_history(instType='SWAP')
             if not isinstance(result, dict) or result.get('code') != '0':
                 return {}
 
             target_inst_id = config.OKX_SYMBOLS.get(coin)
             target_direction = 'long' if side == 'long' else 'short'
+
+            candidates = []
             for item in result.get('data', []):
-                if item.get('instId') == target_inst_id and item.get('posSide') == target_direction:
-                    return item
-            return {}
+                if item.get('instId') != target_inst_id or item.get('posSide') != target_direction:
+                    continue
+
+                ts_raw = item.get('uTime') or item.get('cTime') or 0
+                try:
+                    ts_ms = int(ts_raw)
+                except Exception:
+                    ts_ms = 0
+
+                if after_ms is not None and ts_ms < int(after_ms):
+                    continue
+
+                candidates.append((ts_ms, item))
+
+            if not candidates:
+                return {}
+
+            candidates.sort(key=lambda pair: pair[0], reverse=True)
+            return candidates[0][1]
         except Exception as e:
             print(f"[ERROR] 获取历史平仓持仓失败: {e}")
             return {}

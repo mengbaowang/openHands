@@ -8,8 +8,8 @@ class TradingApp {
         this.klineChart = null;
         this.currentKlineCoin = 'BTC';
         this.klineColorMode = 'red-up'; // 默认红涨绿跌
-        this.marketRefreshInterval = Number(appConfig.market_refresh_interval) || 5000;
-        this.portfolioRefreshInterval = Number(appConfig.portfolio_refresh_interval) || 10000;
+        this.marketRefreshInterval = Number(appConfig.market_refresh_interval) || 15000;
+        this.portfolioRefreshInterval = Number(appConfig.portfolio_refresh_interval) || 30000;
         this.trades = [];
         this.tradeFilters = {
             coin: '',
@@ -601,7 +601,7 @@ class TradingApp {
 
                 if (parsedData) {
                     // 检查是否是嵌套格式：{"BTC": {"signal": "hold", "reasoning": {...}}}
-                    const coinKeys = ['BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'XRP'];
+                    const coinKeys = ['BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'XRP', 'ZEC'];
                     for (const coin of coinKeys) {
                         if (parsedData[coin]) {
                             coinData = parsedData[coin];

@@ -8,6 +8,10 @@ from services.execution.position_metrics import (
     build_position_metrics,
     calculate_peak_drawdown_stop,
 )
+from services.execution.reversal_signal import (
+    EARLY_REVERSAL_SENSITIVITY,
+    build_reversal_exit_signal,
+)
 from services.exchanges.okx_adapter import OKXTrader
 
 
@@ -24,7 +28,7 @@ class ExecutionService:
     }
     DEFAULT_STOP_LOSS_PCT = 0.03
     DEFAULT_TAKE_PROFIT_PCT = 0.06
-    EARLY_PROFIT_PROTECTION_PCT = 0.015
+    EARLY_PROFIT_PROTECTION_PCT = 0.01
 
     def __init__(self, model_id: int, db, debug_log=None):
         self.model_id = model_id
@@ -36,6 +40,7 @@ class ExecutionService:
             self.okx_trader = OKXTrader()
         self.peak_profit_activation_pct = PEAK_PROFIT_ACTIVATION_PCT
         self.peak_drawdown_close_ratio = PEAK_DRAWDOWN_CLOSE_RATIO
+        self.early_reversal_sensitivity = EARLY_REVERSAL_SENSITIVITY
 
     def _debug_log(self, message: str) -> None:
         if self._debug_callback:
@@ -383,7 +388,10 @@ class ExecutionService:
             position_quantity = pos.get('coin_quantity', 0.0)
             position_value = pos.get('notional_usdt', position_quantity * current_price)
             positions_value += position_value
-            if pos['side'] == 'long':
+            okx_unrealized_pnl = pos.get('unrealized_pnl')
+            if okx_unrealized_pnl is not None:
+                pos_pnl = float(okx_unrealized_pnl)
+            elif pos['side'] == 'long':
                 pos_pnl = (current_price - pos['avg_price']) * position_quantity
             else:
                 pos_pnl = (pos['avg_price'] - current_price) * position_quantity
@@ -407,6 +415,7 @@ class ExecutionService:
                 'current_price': current_price,
                 'leverage': pos['leverage'],
                 'pnl': pos_pnl,
+                'okx_unrealized_pnl': pos.get('unrealized_pnl'),
                 'stop_loss': db_pos.get('stop_loss') if db_pos else None,
                 'take_profit': db_pos.get('take_profit') if db_pos else None,
                 'peak_price': metrics['peak_price'],
@@ -456,6 +465,91 @@ class ExecutionService:
 
             weak_15m = self._timeframe_is_weakening(side, coin_timeframes.get('15m', {}))
             weak_5m = self._timeframe_is_weakening(side, coin_timeframes.get('5m', {}))
+            reversal_signal = build_reversal_exit_signal(
+                side=side,
+                entry_price=entry_price,
+                current_price=current_price,
+                peak_price=peak_price,
+                current_profit_pct=current_profit_pct,
+                peak_profit_pct=peak_profit_pct,
+                leverage=int(position['leverage']),
+                tf_15m=coin_timeframes.get('15m', {}),
+                tf_5m=coin_timeframes.get('5m', {}),
+                tf_1h=coin_timeframes.get('1h', {}),
+                sensitivity=self.early_reversal_sensitivity,
+            )
+
+            if reversal_signal.get('eligible'):
+                top_reasons = '; '.join(reversal_signal.get('reasons', [])[:3]) or 'no dominant reason'
+                self._debug_log(
+                    f"{coin} early_reversal score={reversal_signal['score']:.2f} "
+                    f"(warn={reversal_signal['warning_threshold']:.2f}, exit={reversal_signal['exit_threshold']:.2f}) "
+                    f"{top_reasons}"
+                )
+
+            if reversal_signal.get('should_exit'):
+                close_result = self._execute_close_okx(
+                    coin,
+                    {'signal': 'sell_to_close' if side == 'long' else 'buy_to_close', 'quantity': position.get('quantity', 0)},
+                    {coin: {'price': current_price}},
+                    portfolio,
+                    close_all=True
+                )
+                close_result['reason'] = (
+                    f"Early reversal exit triggered at score {reversal_signal['score']:.2f} "
+                    f"(threshold {reversal_signal['exit_threshold']:.2f}): "
+                    + '; '.join(reversal_signal.get('reasons', [])[:4])
+                )
+                results.append(close_result)
+                continue
+
+            if reversal_signal.get('should_tighten_stop'):
+                suggested_stop_loss = reversal_signal.get('suggested_stop_loss')
+                improved_preemptive_stop = (
+                    suggested_stop_loss is not None and
+                    (
+                        stop_loss is None or
+                        (side == 'long' and suggested_stop_loss > stop_loss) or
+                        (side == 'short' and suggested_stop_loss < stop_loss)
+                    )
+                )
+                if improved_preemptive_stop:
+                    risk_sync = self._sync_okx_native_risk_order(
+                        coin,
+                        side=side,
+                        contracts=position.get('contracts', position.get('size', 0)),
+                        stop_loss=suggested_stop_loss,
+                        take_profit=take_profit,
+                        db_pos=db_pos
+                    )
+                    if risk_sync.get('success'):
+                        self.db.update_position(
+                            self.model_id,
+                            coin,
+                            position.get('quantity', position.get('coin_quantity', 0.0)),
+                            entry_price,
+                            position['leverage'],
+                            side,
+                            suggested_stop_loss,
+                            take_profit,
+                            entry_ord_id=db_pos.get('entry_ord_id'),
+                            okx_risk_algo_id=risk_sync.get('algo_id'),
+                            okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
+                            trailing_tier=max(float(db_pos.get('trailing_tier') or 0), 0.004),
+                            peak_price=peak_price,
+                            peak_profit_pct=peak_profit_pct,
+                            last_profit_pct=current_profit_pct
+                        )
+                        results.append({
+                            'coin': coin,
+                            'signal': 'move_stop_loss',
+                            'price': current_price,
+                            'message': (
+                                f"{coin} tightened stop preemptively on early reversal score "
+                                f"{reversal_signal['score']:.2f} -> ${suggested_stop_loss:.2f}"
+                            )
+                        })
+                        stop_loss = suggested_stop_loss
 
             if peak_profit_pct >= self.EARLY_PROFIT_PROTECTION_PCT and weak_15m and weak_5m:
                 break_even_stop = self._get_break_even_stop(entry_price, side, int(position['leverage']))

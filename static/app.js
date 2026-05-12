@@ -10,6 +10,7 @@ class TradingApp {
         this.klineColorMode = 'red-up'; // 默认红涨绿跌
         this.marketRefreshInterval = Number(appConfig.market_refresh_interval) || 15000;
         this.portfolioRefreshInterval = Number(appConfig.portfolio_refresh_interval) || 30000;
+        this.positionPnlRefreshInterval = Number(appConfig.position_pnl_refresh_interval) || 5000;
         this.trades = [];
         this.tradeFilters = {
             coin: '',
@@ -20,8 +21,16 @@ class TradingApp {
         this.refreshIntervals = {
             market: null,
             portfolio: null,
+            positionPnl: null,
             trades: null
         };
+        this.isLoadingModels = false;
+        this.isLoadingModelData = false;
+        this.isLoadingMarketPrices = false;
+        this.isLoadingKlineData = false;
+        this.pendingModelDataRefresh = false;
+        this.pendingMarketRefresh = false;
+        this.pendingKlineRefresh = false;
         this.init();
     }
 
@@ -30,10 +39,17 @@ class TradingApp {
         await this.checkAuth();
 
         this.initEventListeners();
+        this.restoreCachedMarketPrices();
         this.initKlineChart();
-        this.loadModels();
-        this.loadMarketPrices();
+        const models = await this.loadModels();
+        if (models.length > 0) {
+            const savedModelId = this.getSavedModelId();
+            const preferredModel = models.find(model => model.id === savedModelId) || models[0];
+            await this.selectModel(preferredModel.id, { useCache: true, refreshModels: false });
+        }
+        await this.loadMarketPrices({ useCache: false });
         this.startRefreshCycles();
+        this.initVisibilityRefresh();
     }
 
     async checkAuth() {
@@ -72,6 +88,73 @@ class TradingApp {
             "'": '&#039;'
         };
         return text.replace(/[&<>"']/g, m => map[m]);
+    }
+
+    getSavedModelId() {
+        const rawValue = localStorage.getItem('dashboard_selected_model_id');
+        const modelId = Number(rawValue);
+        return Number.isFinite(modelId) && modelId > 0 ? modelId : null;
+    }
+
+    saveSelectedModelId(modelId) {
+        if (Number.isFinite(Number(modelId))) {
+            localStorage.setItem('dashboard_selected_model_id', String(modelId));
+        }
+    }
+
+    getCacheKey(name, modelId = null) {
+        return modelId ? `dashboard:${name}:${modelId}` : `dashboard:${name}`;
+    }
+
+    readCache(key) {
+        try {
+            const rawValue = sessionStorage.getItem(key);
+            return rawValue ? JSON.parse(rawValue) : null;
+        } catch (error) {
+            console.warn('Failed to read cache:', key, error);
+            return null;
+        }
+    }
+
+    writeCache(key, value) {
+        try {
+            sessionStorage.setItem(key, JSON.stringify({
+                savedAt: Date.now(),
+                value
+            }));
+        } catch (error) {
+            console.warn('Failed to write cache:', key, error);
+        }
+    }
+
+    restoreCachedMarketPrices() {
+        const cached = this.readCache(this.getCacheKey('market_prices'));
+        if (cached && cached.value && Object.keys(cached.value).length > 0) {
+            this.renderMarketPrices(cached.value);
+        }
+    }
+
+    restoreCachedModelData(modelId) {
+        const cached = this.readCache(this.getCacheKey('model_snapshot', modelId));
+        if (!cached || !cached.value) return false;
+
+        const { portfolio, trades, conversations } = cached.value;
+        if (portfolio && portfolio.portfolio) {
+            this.updateStats(portfolio.portfolio);
+            this.updateChart(portfolio.account_value_history || [], portfolio.portfolio.total_value);
+            this.updatePositions(portfolio.portfolio.positions || []);
+        }
+        if (Array.isArray(trades)) {
+            this.updateTrades(trades);
+        }
+        if (Array.isArray(conversations)) {
+            this.updateConversations(conversations);
+        }
+        return true;
+    }
+
+    cacheModelData(modelId, snapshot) {
+        this.writeCache(this.getCacheKey('model_snapshot', modelId), snapshot);
     }
 
     initEventListeners() {
@@ -152,6 +235,10 @@ class TradingApp {
     }
 
     async loadModels() {
+        if (this.isLoadingModels) {
+            return [];
+        }
+        this.isLoadingModels = true;
         try {
             const response = await fetch('/api/models', {
                 credentials: 'include'
@@ -159,17 +246,17 @@ class TradingApp {
 
             if (response.status === 401) {
                 window.location.href = '/login';
-                return;
+                return [];
             }
 
             const models = await response.json();
             this.renderModels(models);
-
-            if (models.length > 0 && !this.currentModelId) {
-                this.selectModel(models[0].id);
-            }
+            return Array.isArray(models) ? models : [];
         } catch (error) {
             console.error('Failed to load models:', error);
+            return [];
+        } finally {
+            this.isLoadingModels = false;
         }
     }
 
@@ -200,17 +287,41 @@ class TradingApp {
         `).join('');
     }
 
-    async selectModel(modelId) {
+    async selectModel(modelId, options = {}) {
+        const { useCache = true, refreshModels = true } = options;
+        if (!modelId) return;
+
         this.currentModelId = modelId;
-        this.loadModels();
-        await this.loadModelData();
+        this.saveSelectedModelId(modelId);
+
+        if (refreshModels) {
+            const models = await this.loadModels();
+            if (models.length > 0) {
+                this.renderModels(models);
+            }
+        }
+
+        if (useCache) {
+            this.restoreCachedModelData(modelId);
+        }
+
+        await this.loadModelData({ silentIfBusy: false });
     }
 
-    async loadModelData() {
+    async loadModelData(options = {}) {
         if (!this.currentModelId) return;
 
+        if (this.isLoadingModelData) {
+            this.pendingModelDataRefresh = true;
+            if (!options.silentIfBusy) {
+                console.debug('Model data request skipped because another request is in flight.');
+            }
+            return;
+        }
+
+        this.isLoadingModelData = true;
+
         try {
-            // 添加超时控制
             const timeout = (ms) => new Promise((_, reject) =>
                 setTimeout(() => reject(new Error('Request timeout')), ms)
             );
@@ -227,7 +338,6 @@ class TradingApp {
                 fetchWithTimeout(`/api/models/${this.currentModelId}/conversations?limit=20`)
             ]);
 
-            // 检查响应状态
             if (portfolioRes.status === 401 || tradesRes.status === 401 || conversationsRes.status === 401) {
                 console.warn('Session expired, redirecting to login...');
                 window.location.href = '/login';
@@ -241,20 +351,67 @@ class TradingApp {
             ]);
 
             this.updateStats(portfolio.portfolio);
-            this.updateChart(portfolio.account_value_history, portfolio.portfolio.total_value);
-            this.updatePositions(portfolio.portfolio.positions);
+            this.updateChart(portfolio.account_value_history || [], portfolio.portfolio.total_value);
+            this.updatePositions(portfolio.portfolio.positions || []);
             this.updateTrades(trades);
             this.updateConversations(conversations);
+            this.cacheModelData(this.currentModelId, { portfolio, trades, conversations });
         } catch (error) {
             console.error('Failed to load model data:', error);
 
-            // 显示错误提示
             if (error.message === 'Request timeout') {
                 console.warn('Request timeout, retrying...');
-                // 3秒后重试
-                setTimeout(() => this.loadModelData(), 3000);
+                setTimeout(() => this.loadModelData({ silentIfBusy: true }), 3000);
             } else if (error.message.includes('Failed to fetch')) {
                 console.error('Network error, please check your connection');
+            }
+        } finally {
+            this.isLoadingModelData = false;
+            if (this.pendingModelDataRefresh) {
+                this.pendingModelDataRefresh = false;
+                queueMicrotask(() => this.loadModelData({ silentIfBusy: true }));
+            }
+        }
+    }
+
+    async loadPortfolioSnapshot(options = {}) {
+        if (!this.currentModelId) return;
+
+        if (this.isLoadingModelData) {
+            this.pendingModelDataRefresh = true;
+            return;
+        }
+
+        this.isLoadingModelData = true;
+
+        try {
+            const response = await fetch(`/api/models/${this.currentModelId}/portfolio`, {
+                credentials: 'include'
+            });
+
+            if (response.status === 401) {
+                window.location.href = '/login';
+                return;
+            }
+
+            const portfolio = await response.json();
+            this.updateStats(portfolio.portfolio);
+            this.updateChart(portfolio.account_value_history || [], portfolio.portfolio.total_value);
+            this.updatePositions(portfolio.portfolio.positions || []);
+
+            if (!options.skipCacheWrite) {
+                const cached = this.readCache(this.getCacheKey('model_snapshot', this.currentModelId));
+                const trades = cached?.value?.trades || this.trades || [];
+                const conversations = cached?.value?.conversations || [];
+                this.cacheModelData(this.currentModelId, { portfolio, trades, conversations });
+            }
+        } catch (error) {
+            console.error('Failed to load portfolio snapshot:', error);
+        } finally {
+            this.isLoadingModelData = false;
+            if (this.pendingModelDataRefresh) {
+                this.pendingModelDataRefresh = false;
+                queueMicrotask(() => this.loadPortfolioSnapshot({ skipCacheWrite: true }));
             }
         }
     }
@@ -747,13 +904,33 @@ class TradingApp {
         }).join('');
     }
 
-    async loadMarketPrices() {
+    async loadMarketPrices(options = {}) {
+        const { useCache = true } = options;
+
+        if (this.isLoadingMarketPrices) {
+            this.pendingMarketRefresh = true;
+            return;
+        }
+
+        if (useCache) {
+            this.restoreCachedMarketPrices();
+        }
+
+        this.isLoadingMarketPrices = true;
+
         try {
             const response = await fetch('/api/market/prices');
             const prices = await response.json();
             this.renderMarketPrices(prices);
+            this.writeCache(this.getCacheKey('market_prices'), prices);
         } catch (error) {
             console.error('Failed to load market prices:', error);
+        } finally {
+            this.isLoadingMarketPrices = false;
+            if (this.pendingMarketRefresh) {
+                this.pendingMarketRefresh = false;
+                queueMicrotask(() => this.loadMarketPrices({ useCache: false }));
+            }
         }
     }
 
@@ -938,11 +1115,30 @@ class TradingApp {
     }
 
     async refresh() {
+        const models = await this.loadModels();
+        if (models.length > 0 && this.currentModelId && !models.some(model => model.id === this.currentModelId)) {
+            this.currentModelId = models[0].id;
+            this.saveSelectedModelId(this.currentModelId);
+        }
         await Promise.all([
-            this.loadModels(),
-            this.loadMarketPrices(),
-            this.loadModelData()
+            this.loadMarketPrices({ useCache: false }),
+            this.loadPortfolioSnapshot({ skipCacheWrite: false }),
+            this.loadModelData({ silentIfBusy: false }),
+            this.loadKlineData()
         ]);
+    }
+
+    initVisibilityRefresh() {
+        const refreshWhenVisible = () => {
+            if (document.visibilityState === 'visible') {
+                this.loadMarketPrices({ useCache: true });
+                this.loadPortfolioSnapshot({ skipCacheWrite: false });
+                this.loadKlineData();
+            }
+        };
+
+        document.addEventListener('visibilitychange', refreshWhenVisible);
+        window.addEventListener('focus', refreshWhenVisible);
     }
 
     startRefreshCycles() {
@@ -950,9 +1146,15 @@ class TradingApp {
             this.loadMarketPrices();
         }, this.marketRefreshInterval);
 
+        this.refreshIntervals.positionPnl = setInterval(() => {
+            if (this.currentModelId) {
+                this.loadPortfolioSnapshot({ skipCacheWrite: false });
+            }
+        }, this.positionPnlRefreshInterval);
+
         this.refreshIntervals.portfolio = setInterval(() => {
             if (this.currentModelId) {
-                this.loadModelData();
+                this.loadModelData({ silentIfBusy: true });
             }
         }, this.portfolioRefreshInterval);
     }
@@ -982,7 +1184,7 @@ class TradingApp {
         if (this.chart) {
             this.chart.dispose();
             this.chart = echarts.init(document.getElementById('accountChart'));
-            this.loadModelData();
+            this.loadPortfolioSnapshot({ skipCacheWrite: false });
         }
         if (this.klineChart) {
             this.klineChart.dispose();

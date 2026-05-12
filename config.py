@@ -46,6 +46,7 @@ OKX_FLAG = '1' if TRADING_MODE == 'okx_demo' else '0'  # 1=模拟盘, 0=实盘
 # ============ 前端刷新频率 ============
 MARKET_REFRESH_INTERVAL = 15000  # 毫秒
 PORTFOLIO_REFRESH_INTERVAL = 30000  # 毫秒
+POSITION_PNL_REFRESH_INTERVAL = 5000  # 毫秒
 
 # ============ 风险管理配置 ============
 # 单笔交易最大风险比例

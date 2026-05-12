@@ -55,6 +55,7 @@ def inject_version():
         'app_config': {
             'market_refresh_interval': config.MARKET_REFRESH_INTERVAL,
             'portfolio_refresh_interval': config.PORTFOLIO_REFRESH_INTERVAL,
+            'position_pnl_refresh_interval': config.POSITION_PNL_REFRESH_INTERVAL,
         }
     }
 

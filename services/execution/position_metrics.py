@@ -2,9 +2,9 @@
 from typing import Dict, Optional
 
 
-ROUND_TRIP_FEE_PCT = 0.001
-PEAK_PROFIT_ACTIVATION_PCT = 0.03
-PEAK_DRAWDOWN_CLOSE_RATIO = 0.20
+ROUND_TRIP_FEE_PCT = 0.001  # 0.1% 作为单程交易手续费
+PEAK_PROFIT_ACTIVATION_PCT = 0.02   # 2% 作为峰值利润激活阈值
+PEAK_DRAWDOWN_CLOSE_RATIO = 0.20   # 20% 作为峰值回撤关闭阈值
 
 
 def calculate_net_profit_pct(entry_price: float, current_price: float, side: str, leverage: int) -> float:
@@ -34,7 +34,7 @@ def price_from_locked_profit_pct(entry_price: float, side: str, leverage: int, l
 
 
 def calculate_peak_drawdown_stop(entry_price: float, peak_profit_pct: float, side: str, leverage: int):
-    if peak_profit_pct < 0.03:
+    if peak_profit_pct < 0.02:
         return 0.0, None
     if peak_profit_pct < 0.05:
         locked_profit_pct = max(0.005, peak_profit_pct - 0.015)

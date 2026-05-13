@@ -1,5 +1,6 @@
 """基于 OKX 的执行层，负责下单、平仓与持仓状态管理。"""
 import time
+from datetime import datetime, timezone
 from typing import Dict
 
 from services.execution.position_metrics import (
@@ -29,6 +30,13 @@ class ExecutionService:
     DEFAULT_STOP_LOSS_PCT = 0.03
     DEFAULT_TAKE_PROFIT_PCT = 0.06
     EARLY_PROFIT_PROTECTION_PCT = 0.01
+    MIN_ENTRY_RR = 1.05
+    MIN_ENTRY_NET_TARGET_PCT = 0.0015
+    WEAK_MARKET_LONG_POST_FILL_RR_FLOOR = 1.35
+    WEAK_MARKET_LONG_POST_FILL_NET_TARGET_PCT = 0.0020
+    FAILED_TRADE_EXIT_THRESHOLD = 0.72
+    FAILED_TRADE_STOP_PROGRESS_FLOOR = 0.55
+    FAILED_TRADE_MIN_LOSS_PCT = -0.005
 
     def __init__(self, model_id: int, db, debug_log=None):
         self.model_id = model_id
@@ -107,7 +115,7 @@ class ExecutionService:
             closed_snapshot = self.okx_trader.get_recent_closed_position(row['coin'], row['side'], after_ms=after_ms)
             if not closed_snapshot:
                 self._debug_log(
-                    f"reconcile_pending:{row['coin']}:{row['side']}",
+                    f"reconcile_pending:{row['coin']}:{row['side']} "
                     f"[WARN] {row['coin']} {row['side']} 在 OKX 中未找到足够新的平仓快照，跳过本轮对账，避免误判。"
                 )
                 continue
@@ -117,7 +125,7 @@ class ExecutionService:
             gross_raw = closed_snapshot.get('pnl')
             if close_price <= 0 or realized_pnl in (None, ''):
                 self._debug_log(
-                    f"reconcile_incomplete:{row['coin']}:{row['side']}",
+                    f"reconcile_incomplete:{row['coin']}:{row['side']} "
                     f"[WARN] {row['coin']} {row['side']} 平仓快照不完整(closeAvgPx/realizedPnl 缺失)，跳过本轮对账。"
                 )
                 continue
@@ -242,6 +250,429 @@ class ExecutionService:
             return entry_price * (1 + fee_adjustment)
         return entry_price * (1 - fee_adjustment)
 
+    def _expected_net_target_pct(self, side: str, entry_price: float, take_profit: float = None) -> float:
+        if entry_price <= 0 or take_profit is None:
+            return 0.0
+        if side == 'long':
+            gross_move = (float(take_profit) - float(entry_price)) / float(entry_price)
+        else:
+            gross_move = (float(entry_price) - float(take_profit)) / float(entry_price)
+        return gross_move - 0.001
+
+    def _classify_trend_regime(self, indicators: Dict) -> str:
+        if not indicators:
+            return 'unknown'
+
+        current_price = float(indicators.get('current_price', 0) or 0)
+        sma5 = float(indicators.get('sma_5', 0) or 0)
+        sma14 = float(indicators.get('sma_14', 0) or 0)
+        sma30 = float(indicators.get('sma_30', 0) or 0)
+        rsi = float(indicators.get('rsi_14', 50) or 50)
+        macd_hist = float(indicators.get('macd_histogram', 0) or 0)
+
+        if sma14 > 0 and current_price > sma14 and macd_hist > 0 and rsi >= 60:
+            if sma30 > 0 and current_price > sma30 and rsi >= 68 and sma5 >= sma14:
+                return 'strong_bull'
+            return 'weak_bull'
+        if sma14 > 0 and current_price < sma14 and macd_hist < 0 and rsi <= 40:
+            if sma30 > 0 and current_price < sma30 and rsi <= 35 and sma5 <= sma14:
+                return 'strong_bear'
+            return 'weak_bear'
+        if sma14 > 0 and current_price < sma14 and macd_hist < 0 and rsi < 48:
+            return 'weak_bear'
+        if sma14 > 0 and current_price > sma14 and macd_hist > 0 and rsi > 52:
+            return 'weak_bull'
+        return 'neutral'
+
+    def _is_adverse_regime(self, side: str, regime: str) -> bool:
+        if side == 'long':
+            return regime in {'weak_bear', 'strong_bear'}
+        return regime in {'weak_bull', 'strong_bull'}
+
+    def _timeframe_has_restart_confirmation(self, side: str, indicators: Dict) -> bool:
+        if not indicators:
+            return False
+
+        current_price = float(indicators.get('current_price', 0) or 0)
+        sma5 = float(indicators.get('sma_5', 0) or 0)
+        sma14 = float(indicators.get('sma_14', 0) or 0)
+        rsi = float(indicators.get('rsi_14', 50) or 50)
+        macd_hist = float(indicators.get('macd_histogram', 0) or 0)
+        volume_ratio = float(indicators.get('volume_ratio', 0) or 0)
+
+        score = 0
+        if side == 'long':
+            if macd_hist > 0:
+                score += 1
+            if sma5 > 0 and current_price > sma5:
+                score += 1
+            if sma14 > 0 and current_price >= sma14 * 0.998:
+                score += 1
+            if rsi >= 52:
+                score += 1
+            if volume_ratio >= 0.80:
+                score += 1
+            return score >= 3 and macd_hist > 0 and sma5 > 0 and current_price > sma5
+
+        if macd_hist < 0:
+            score += 1
+        if sma5 > 0 and current_price < sma5:
+            score += 1
+        if sma14 > 0 and current_price <= sma14 * 1.002:
+            score += 1
+        if rsi <= 48:
+            score += 1
+        if volume_ratio >= 0.80:
+            score += 1
+        return score >= 3 and macd_hist < 0 and sma5 > 0 and current_price < sma5
+
+    def _evaluate_entry_guardrails(self, side: str, entry_price: float, stop_loss: float = None,
+                                   take_profit: float = None, timeframes: Dict = None,
+                                   confidence: float = 0.60) -> Dict:
+        timeframes = timeframes or {}
+        tf_1h = timeframes.get('1h', {}) or {}
+        tf_15m = timeframes.get('15m', {}) or {}
+        tf_5m = timeframes.get('5m', {}) or {}
+
+        rr = self._estimate_rr(side, entry_price, stop_loss, take_profit)
+        expected_net_target_pct = self._expected_net_target_pct(side, entry_price, take_profit)
+        regime_1h = self._classify_trend_regime(tf_1h)
+        adverse_regime = self._is_adverse_regime(side, regime_1h)
+        confirm_15m = self._timeframe_has_restart_confirmation(side, tf_15m)
+        confirm_5m = self._timeframe_has_restart_confirmation(side, tf_5m)
+        room_15m = self._room_to_extreme(side, entry_price, tf_15m)
+        room_1h = self._room_to_extreme(side, entry_price, tf_1h)
+        reasons = []
+        hard_block = False
+
+        if rr < self.MIN_ENTRY_RR:
+            hard_block = True
+            reasons.append(f'actual RR {rr:.2f} is below hard floor {self.MIN_ENTRY_RR:.2f}')
+        if expected_net_target_pct < self.MIN_ENTRY_NET_TARGET_PCT:
+            hard_block = True
+            reasons.append(
+                f'net target {expected_net_target_pct * 100:.2f}% is below floor '
+                f'{self.MIN_ENTRY_NET_TARGET_PCT * 100:.2f}%'
+            )
+        min_room_pct = min([value for value in (room_15m['pct'], room_1h['pct']) if value > 0] or [0.0])
+        min_room_atr = min([value for value in (room_15m['atr'], room_1h['atr']) if value > 0] or [0.0])
+        if min_room_pct > 0 and min_room_pct < 0.0035:
+            hard_block = True
+            reasons.append(f'room to recent extreme is only {min_room_pct * 100:.2f}%')
+        if min_room_atr > 0 and min_room_atr < 0.45:
+            hard_block = True
+            reasons.append(f'room to recent extreme is only {min_room_atr:.2f} ATR')
+        setup_class = self._classify_setup_class(
+            side,
+            confidence,
+            entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframes=timeframes,
+        )
+
+        return {
+            'rr': rr,
+            'expected_net_target_pct': expected_net_target_pct,
+            'regime_1h': regime_1h,
+            'adverse_regime': adverse_regime,
+            'confirm_15m': confirm_15m,
+            'confirm_5m': confirm_5m,
+            'room_15m': room_15m,
+            'room_1h': room_1h,
+            'setup_class': setup_class,
+            'hard_block': hard_block,
+            'reasons': reasons,
+        }
+
+    def _stop_progress_ratio(self, side: str, entry_price: float, current_price: float, stop_loss: float = None) -> float:
+        if stop_loss is None:
+            return 0.0
+        if side == 'long':
+            risk = entry_price - float(stop_loss)
+            adverse_move = entry_price - current_price
+        else:
+            risk = float(stop_loss) - entry_price
+            adverse_move = current_price - entry_price
+        if risk <= 0:
+            return 0.0
+        return max(0.0, adverse_move / risk)
+
+    def _evaluate_failed_trade_exit(self, side: str, entry_price: float, current_price: float,
+                                    stop_loss: float = None, current_profit_pct: float = 0.0,
+                                    timeframes: Dict = None) -> Dict:
+        timeframes = timeframes or {}
+        result = {
+            'eligible': False,
+            'score': 0.0,
+            'should_exit': False,
+            'stop_progress': 0.0,
+            'reasons': [],
+        }
+        if stop_loss is None or current_profit_pct >= 0:
+            return result
+
+        stop_progress = self._stop_progress_ratio(side, entry_price, current_price, stop_loss)
+        result['stop_progress'] = stop_progress
+        if stop_progress < self.FAILED_TRADE_STOP_PROGRESS_FLOOR and current_profit_pct > self.FAILED_TRADE_MIN_LOSS_PCT:
+            return result
+
+        tf_1h = timeframes.get('1h', {}) or {}
+        tf_15m = timeframes.get('15m', {}) or {}
+        tf_5m = timeframes.get('5m', {}) or {}
+        regime_1h = self._classify_trend_regime(tf_1h)
+        adverse_regime = self._is_adverse_regime(side, regime_1h)
+        weak_15m = self._timeframe_is_weakening(side, tf_15m)
+        weak_5m = self._timeframe_is_weakening(side, tf_5m)
+
+        score = 0.0
+        reasons = []
+        if adverse_regime:
+            score += 0.28
+            reasons.append(f'1h regime is {regime_1h}')
+        if weak_15m:
+            score += 0.24
+            reasons.append('15m momentum is still weakening')
+        if weak_5m:
+            score += 0.20
+            reasons.append('5m momentum is still weakening')
+        if stop_progress >= self.FAILED_TRADE_STOP_PROGRESS_FLOOR:
+            score += 0.16
+            reasons.append(f'price has already traveled {stop_progress * 100:.0f}% of the stop distance')
+        if stop_progress >= 0.75:
+            score += 0.08
+        if current_profit_pct <= -0.01:
+            score += 0.10
+            reasons.append(f'net loss has expanded to {current_profit_pct * 100:.2f}%')
+
+        recent_extreme = float(
+            (tf_15m.get('recent_low_20') if side == 'long' else tf_15m.get('recent_high_20')) or 0
+        )
+        if recent_extreme > 0:
+            if side == 'long' and current_price <= recent_extreme * 1.001:
+                score += 0.06
+                reasons.append('15m support is no longer holding cleanly')
+            elif side == 'short' and current_price >= recent_extreme * 0.999:
+                score += 0.06
+                reasons.append('15m resistance is no longer holding cleanly')
+
+        result['eligible'] = True
+        result['score'] = min(score, 1.0)
+        result['reasons'] = reasons
+        result['should_exit'] = result['score'] >= self.FAILED_TRADE_EXIT_THRESHOLD
+        return result
+
+    def _should_abort_post_fill_entry(self, side: str, entry_price: float, stop_loss: float = None,
+                                      take_profit: float = None, timeframes: Dict = None) -> tuple[bool, list[str]]:
+        guardrails = self._evaluate_entry_guardrails(
+            side,
+            entry_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframes=timeframes,
+        )
+        reasons = list(guardrails.get('reasons', []))
+        should_abort = guardrails.get('hard_block', False)
+
+        if side == 'long' and guardrails.get('adverse_regime'):
+            if not (guardrails.get('confirm_15m') and guardrails.get('confirm_5m')):
+                if guardrails.get('rr', 0) < self.WEAK_MARKET_LONG_POST_FILL_RR_FLOOR:
+                    should_abort = True
+                    reasons.append(
+                        f"weak-market rebound long RR {guardrails['rr']:.2f} is below "
+                        f"{self.WEAK_MARKET_LONG_POST_FILL_RR_FLOOR:.2f}"
+                    )
+                if guardrails.get('expected_net_target_pct', 0) < self.WEAK_MARKET_LONG_POST_FILL_NET_TARGET_PCT:
+                    should_abort = True
+                    reasons.append(
+                        f"weak-market rebound net target {guardrails['expected_net_target_pct'] * 100:.2f}% "
+                        f"is below {self.WEAK_MARKET_LONG_POST_FILL_NET_TARGET_PCT * 100:.2f}%"
+                    )
+
+        return should_abort, reasons
+
+    def _abort_fresh_entry(self, coin: str, side: str, quantity: float, market_state: Dict, reason: str) -> Dict:
+        close_result = self._execute_close_okx(
+            coin,
+            {'signal': 'sell_to_close' if side == 'long' else 'buy_to_close', 'quantity': quantity},
+            market_state,
+            {'positions': []},
+            close_all=True
+        )
+        close_result['warning'] = reason
+        close_result['message'] = f'Fresh entry closed immediately: {reason}'
+        return close_result
+
+    def _abort_added_size(self, coin: str, side: str, quantity: float, market_state: Dict, reason: str) -> Dict:
+        close_result = self._execute_close_okx(
+            coin,
+            {'signal': 'reduce_position', 'quantity': quantity},
+            market_state,
+            {'positions': []},
+            close_all=False
+        )
+        close_result['warning'] = reason
+        close_result['message'] = f'Fresh add closed immediately: {reason}'
+        return close_result
+
+    def _room_to_extreme(self, side: str, current_price: float, indicators: Dict) -> Dict:
+        current_price = float(current_price or 0)
+        atr = float((indicators or {}).get('atr_14', 0) or 0)
+        if current_price <= 0:
+            return {'pct': 0.0, 'atr': 0.0}
+
+        if side == 'long':
+            extreme = float((indicators or {}).get('recent_high_20', 0) or 0)
+            room = max(0.0, extreme - current_price) if extreme > 0 else 0.0
+        else:
+            extreme = float((indicators or {}).get('recent_low_20', 0) or 0)
+            room = max(0.0, current_price - extreme) if extreme > 0 else 0.0
+
+        pct = room / current_price if current_price > 0 else 0.0
+        atr_room = room / atr if atr > 0 else 0.0
+        return {'pct': pct, 'atr': atr_room}
+
+    def _classify_setup_class(self, side: str, confidence: float, entry_price: float,
+                              stop_loss: float = None, take_profit: float = None,
+                              timeframes: Dict = None) -> str:
+        timeframes = timeframes or {}
+        tf_1h = timeframes.get('1h', {}) or {}
+        tf_15m = timeframes.get('15m', {}) or {}
+        tf_5m = timeframes.get('5m', {}) or {}
+
+        rr = self._estimate_rr(side, entry_price, stop_loss, take_profit)
+        expected_net_target_pct = self._expected_net_target_pct(side, entry_price, take_profit)
+        regime_1h = self._classify_trend_regime(tf_1h)
+        restart_15m = self._timeframe_has_restart_confirmation(side, tf_15m)
+        restart_5m = self._timeframe_has_restart_confirmation(side, tf_5m)
+        room_15m = self._room_to_extreme(side, entry_price, tf_15m)
+        room_1h = self._room_to_extreme(side, entry_price, tf_1h)
+        volume_15m = float(tf_15m.get('volume_ratio', 0) or 0)
+        volume_5m = float(tf_5m.get('volume_ratio', 0) or 0)
+        adverse_regime = self._is_adverse_regime(side, regime_1h)
+
+        min_room_pct = min([value for value in (room_15m['pct'], room_1h['pct']) if value > 0] or [0.0])
+        min_room_atr = min([value for value in (room_15m['atr'], room_1h['atr']) if value > 0] or [0.0])
+
+        if rr < 1.0 or expected_net_target_pct < 0.0012:
+            return 'D'
+        if min_room_pct > 0 and min_room_pct < 0.0025:
+            return 'D'
+        if min_room_atr > 0 and min_room_atr < 0.35:
+            return 'D'
+
+        if adverse_regime:
+            if restart_5m and rr >= 1.25 and expected_net_target_pct >= 0.0015 and min_room_pct >= 0.0030:
+                return 'C'
+            return 'D'
+
+        if restart_15m and restart_5m and rr >= 1.55 and expected_net_target_pct >= 0.0022 and min_room_pct >= 0.0040 and min_room_atr >= 0.55 and confidence >= 0.62:
+            return 'A'
+        if restart_5m and rr >= 1.20 and expected_net_target_pct >= 0.0015 and min_room_pct >= 0.0030 and min_room_atr >= 0.40 and confidence >= 0.48:
+            return 'B'
+        return 'D'
+
+    def _position_age_minutes(self, opened_at: str = None) -> float:
+        if not opened_at:
+            return 0.0
+        try:
+            opened = datetime.strptime(opened_at, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - opened).total_seconds() / 60.0)
+        except Exception:
+            return 0.0
+
+    def _evaluate_time_stop(self, side: str, current_profit_pct: float, opened_at: str = None,
+                            setup_class: str = '', timeframes: Dict = None) -> Dict:
+        timeframes = timeframes or {}
+        result = {
+            'eligible': False,
+            'should_exit': False,
+            'age_minutes': 0.0,
+            'reasons': [],
+        }
+        age_minutes = self._position_age_minutes(opened_at)
+        result['age_minutes'] = age_minutes
+        if age_minutes <= 0:
+            return result
+
+        weak_15m = self._timeframe_is_weakening(side, (timeframes.get('15m', {}) or {}))
+        weak_5m = self._timeframe_is_weakening(side, (timeframes.get('5m', {}) or {}))
+        regime_1h = self._classify_trend_regime((timeframes.get('1h', {}) or {}))
+        adverse_regime = self._is_adverse_regime(side, regime_1h)
+
+        max_minutes = 18.0 if setup_class == 'B' else 12.0 if setup_class == 'C' else 0.0
+        if max_minutes <= 0:
+            return result
+
+        result['eligible'] = True
+        reasons = []
+        if age_minutes >= max_minutes:
+            reasons.append(f'position age {age_minutes:.0f}m exceeded {max_minutes:.0f}m budget')
+        if current_profit_pct < 0.002:
+            reasons.append(f'progress is only {current_profit_pct * 100:.2f}%')
+        if adverse_regime:
+            reasons.append(f'1h regime is {regime_1h}')
+        if weak_15m and weak_5m:
+            reasons.append('15m and 5m still have no healthy continuation')
+
+        result['reasons'] = reasons
+        result['should_exit'] = (
+            age_minutes >= max_minutes and
+            current_profit_pct < 0.002 and
+            adverse_regime and
+            weak_15m and weak_5m
+        )
+        return result
+
+    def _evaluate_quality_exit(self, side: str, entry_price: float, current_price: float,
+                               current_profit_pct: float, take_profit: float = None,
+                               setup_class: str = '', management_stage: int = 0,
+                               timeframes: Dict = None) -> Dict:
+        timeframes = timeframes or {}
+        result = {
+            'should_reduce': False,
+            'reduce_ratio': 0.0,
+            'suggested_stop_loss': None,
+            'next_stage': management_stage,
+            'reasons': [],
+        }
+        if setup_class not in {'B', 'C'}:
+            return result
+        if current_profit_pct <= 0:
+            return result
+
+        tf_15m = timeframes.get('15m', {}) or {}
+        tf_5m = timeframes.get('5m', {}) or {}
+        weak_15m = self._timeframe_is_weakening(side, tf_15m)
+        weak_5m = self._timeframe_is_weakening(side, tf_5m)
+        room = self._room_to_extreme(side, current_price, tf_15m)
+
+        reduce_ratio = 0.0
+        reasons = []
+        if management_stage < 1 and current_profit_pct >= 0.0035 and (weak_5m or room['atr'] < 0.35 or room['pct'] < 0.003):
+            reduce_ratio = 0.35 if setup_class == 'B' else 0.50
+            reasons.append('medium-quality trade is in profit but near exhaustion')
+            result['next_stage'] = 1
+        if setup_class == 'C' and management_stage < 1 and current_profit_pct >= 0.0025 and weak_15m:
+            reduce_ratio = max(reduce_ratio, 0.50)
+            reasons.append('countertrend rebound profit should be crystallized earlier')
+            result['next_stage'] = 1
+
+        if current_profit_pct >= 0.0030 and (weak_15m or weak_5m):
+            lock_pct = max(0.0015, current_profit_pct * (0.35 if setup_class == 'B' else 0.50))
+            suggested_stop = self._get_break_even_stop(entry_price, side, 1)
+            if side == 'long':
+                suggested_stop = max(suggested_stop, entry_price * (1 + lock_pct))
+            else:
+                suggested_stop = min(suggested_stop, entry_price * (1 - lock_pct))
+            result['suggested_stop_loss'] = suggested_stop
+            reasons.append('medium-quality trade should lock profit early')
+
+        result['should_reduce'] = reduce_ratio > 0
+        result['reduce_ratio'] = reduce_ratio
+        result['reasons'] = reasons
+        return result
+
     def _get_entry_margin_ratio(self, decision: Dict, market_state: Dict, coin: str, side: str) -> tuple[float, list[str]]:
         confidence = float(decision.get('confidence') or 0)
         if confidence >= 0.75:
@@ -257,6 +688,7 @@ class ExecutionService:
         timeframes = market_state[coin].get('timeframes', {})
         tf_1h = timeframes.get('1h', {})
         tf_15m = timeframes.get('15m', {})
+        tf_5m = timeframes.get('5m', {})
         current_price = market_state[coin]['price']
 
         if side == 'long':
@@ -288,6 +720,17 @@ class ExecutionService:
         if 0 < rr < 2.2:
             ratio *= 0.75
             reasons.append('风险回报比仅勉强达标')
+
+        if side == 'long':
+            regime_1h = self._classify_trend_regime(tf_1h)
+            restart_15m = self._timeframe_has_restart_confirmation('long', tf_15m)
+            restart_5m = self._timeframe_has_restart_confirmation('long', tf_5m)
+            if regime_1h in {'weak_bear', 'strong_bear'}:
+                ratio *= 0.45
+                reasons.append('1H weak-market rebound long')
+            if not (restart_15m and restart_5m):
+                ratio *= 0.70
+                reasons.append('15M/5M restart confirmation is incomplete')
 
         return max(ratio, 0.02), reasons
 
@@ -418,6 +861,11 @@ class ExecutionService:
                 'okx_unrealized_pnl': pos.get('unrealized_pnl'),
                 'stop_loss': db_pos.get('stop_loss') if db_pos else None,
                 'take_profit': db_pos.get('take_profit') if db_pos else None,
+                'opened_at': db_pos.get('opened_at') if db_pos else None,
+                'setup_class': db_pos.get('setup_class') if db_pos else '',
+                'entry_confidence': db_pos.get('entry_confidence') if db_pos else 0,
+                'management_stage': db_pos.get('management_stage') if db_pos else 0,
+                'holding_minutes': self._position_age_minutes(db_pos.get('opened_at') if db_pos else None),
                 'peak_price': metrics['peak_price'],
                 'peak_profit_pct': metrics['peak_profit_pct'],
                 'last_profit_pct': metrics['current_profit_pct'],
@@ -460,11 +908,143 @@ class ExecutionService:
             peak_price = metrics['peak_price']
             timeframes = current_prices.get('__timeframes__', {})
             coin_timeframes = timeframes.get(coin, {})
+            setup_class = str(db_pos.get('setup_class') or '')
+            management_stage = int(db_pos.get('management_stage') or 0)
+            opened_at = db_pos.get('opened_at')
 
             self._debug_log(f"{coin} 净浮盈 {current_profit_pct*100:.2f}%, 峰值净浮盈 {peak_profit_pct*100:.2f}%, 峰值价 {peak_price:.2f}")
 
             weak_15m = self._timeframe_is_weakening(side, coin_timeframes.get('15m', {}))
             weak_5m = self._timeframe_is_weakening(side, coin_timeframes.get('5m', {}))
+            time_stop_signal = self._evaluate_time_stop(
+                side=side,
+                current_profit_pct=current_profit_pct,
+                opened_at=opened_at,
+                setup_class=setup_class,
+                timeframes=coin_timeframes,
+            )
+            if time_stop_signal.get('eligible'):
+                self._debug_log(
+                    f"{coin} time_stop age={time_stop_signal['age_minutes']:.0f}m "
+                    f"class={setup_class or 'unknown'} {'; '.join(time_stop_signal.get('reasons', [])[:3])}"
+                )
+            if time_stop_signal.get('should_exit'):
+                close_result = self._execute_close_okx(
+                    coin,
+                    {'signal': 'sell_to_close' if side == 'long' else 'buy_to_close', 'quantity': position.get('quantity', 0)},
+                    {coin: {'price': current_price}},
+                    portfolio,
+                    close_all=True
+                )
+                close_result['reason'] = (
+                    f"Time-stop exit after {time_stop_signal['age_minutes']:.0f}m on setup {setup_class or 'unknown'}: "
+                    + '; '.join(time_stop_signal.get('reasons', [])[:4])
+                )
+                results.append(close_result)
+                continue
+
+            quality_exit_signal = self._evaluate_quality_exit(
+                side=side,
+                entry_price=entry_price,
+                current_price=current_price,
+                current_profit_pct=current_profit_pct,
+                take_profit=take_profit,
+                setup_class=setup_class,
+                management_stage=management_stage,
+                timeframes=coin_timeframes,
+            )
+            if quality_exit_signal.get('should_reduce'):
+                reduce_quantity = max(0.0, float(position.get('quantity', 0)) * float(quality_exit_signal.get('reduce_ratio', 0)))
+                if reduce_quantity > 0:
+                    close_result = self._execute_close_okx(
+                        coin,
+                        {
+                            'signal': 'reduce_position',
+                            'quantity': reduce_quantity,
+                            '_management_stage': quality_exit_signal.get('next_stage', management_stage),
+                        },
+                        {coin: {'price': current_price}},
+                        portfolio,
+                        close_all=False
+                    )
+                    close_result['reason'] = (
+                        f"Quality exit for setup {setup_class}: "
+                        + '; '.join(quality_exit_signal.get('reasons', [])[:4])
+                    )
+                    results.append(close_result)
+                    continue
+
+            if quality_exit_signal.get('suggested_stop_loss') is not None:
+                suggested_quality_stop = quality_exit_signal.get('suggested_stop_loss')
+                improved_quality_stop = (
+                    stop_loss is None or
+                    (side == 'long' and suggested_quality_stop > stop_loss) or
+                    (side == 'short' and suggested_quality_stop < stop_loss)
+                )
+                if improved_quality_stop:
+                    risk_sync = self._sync_okx_native_risk_order(
+                        coin,
+                        side=side,
+                        contracts=position.get('contracts', position.get('size', 0)),
+                        stop_loss=suggested_quality_stop,
+                        take_profit=take_profit,
+                        db_pos=db_pos
+                    )
+                    if risk_sync.get('success'):
+                        self.db.update_position(
+                            self.model_id,
+                            coin,
+                            position.get('quantity', position.get('coin_quantity', 0.0)),
+                            entry_price,
+                            position['leverage'],
+                            side,
+                            suggested_quality_stop,
+                            take_profit,
+                            entry_ord_id=db_pos.get('entry_ord_id'),
+                            okx_risk_algo_id=risk_sync.get('algo_id'),
+                            okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
+                            trailing_tier=max(float(db_pos.get('trailing_tier') or 0), 0.003),
+                            peak_price=peak_price,
+                            peak_profit_pct=peak_profit_pct,
+                            last_profit_pct=current_profit_pct,
+                            management_stage=max(management_stage, quality_exit_signal.get('next_stage', management_stage)),
+                        )
+                        results.append({
+                            'coin': coin,
+                            'signal': 'move_stop_loss',
+                            'price': current_price,
+                            'message': f'{coin} tightened stop for setup {setup_class or "unknown"} -> ${suggested_quality_stop:.2f}'
+                        })
+                        stop_loss = suggested_quality_stop
+            failed_trade_signal = self._evaluate_failed_trade_exit(
+                side=side,
+                entry_price=entry_price,
+                current_price=current_price,
+                stop_loss=stop_loss,
+                current_profit_pct=current_profit_pct,
+                timeframes=coin_timeframes,
+            )
+            if failed_trade_signal.get('eligible'):
+                self._debug_log(
+                    f"{coin} failed_trade score={failed_trade_signal['score']:.2f} "
+                    f"(stop_progress={failed_trade_signal['stop_progress']:.2f}) "
+                    f"{'; '.join(failed_trade_signal.get('reasons', [])[:3])}"
+                )
+            if failed_trade_signal.get('should_exit'):
+                close_result = self._execute_close_okx(
+                    coin,
+                    {'signal': 'sell_to_close' if side == 'long' else 'buy_to_close', 'quantity': position.get('quantity', 0)},
+                    {coin: {'price': current_price}},
+                    portfolio,
+                    close_all=True
+                )
+                close_result['reason'] = (
+                    f"Failed-trade exit triggered at score {failed_trade_signal['score']:.2f} "
+                    f"after {failed_trade_signal['stop_progress'] * 100:.0f}% of the stop distance: "
+                    + '; '.join(failed_trade_signal.get('reasons', [])[:4])
+                )
+                results.append(close_result)
+                continue
             reversal_signal = build_reversal_exit_signal(
                 side=side,
                 entry_price=entry_price,
@@ -744,6 +1324,19 @@ class ExecutionService:
         self._validate_quantity(quantity, coin)
         self._validate_leverage(leverage)
         stop_loss, take_profit = self._resolve_risk_targets('long', current_price, stop_loss, take_profit)
+        pre_guardrails = self._evaluate_entry_guardrails(
+            'long',
+            current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframes=market_state[coin].get('timeframes', {}),
+            confidence=float(decision.get('confidence') or 0.60),
+        )
+        if pre_guardrails.get('hard_block'):
+            return {
+                'coin': coin,
+                'error': 'Entry rejected by guardrails: ' + '; '.join(pre_guardrails.get('reasons', [])[:3])
+            }
 
         for pos in self.okx_trader.get_positions(allow_stale=True):
             if pos['coin'] == coin:
@@ -776,6 +1369,14 @@ class ExecutionService:
         actual_quantity = actual_position.get('coin_quantity', quantity) if actual_position else quantity
         actual_contracts = actual_position.get('contracts', self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)) if actual_position else self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)
         avg_price = actual_position.get('avg_price', current_price) if actual_position else current_price
+        setup_class = self._classify_setup_class(
+            'long',
+            float(decision.get('confidence') or 0),
+            avg_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframes=market_state[coin].get('timeframes', {}),
+        )
         risk_sync = self._sync_okx_native_risk_order(coin, side='long', contracts=actual_contracts, stop_loss=stop_loss, take_profit=take_profit)
         _, entry_fee, _ = self._extract_order_fill_details(order_status, avg_price)
         self.db.update_position(
@@ -785,9 +1386,24 @@ class ExecutionService:
             entry_fee=entry_fee,
             okx_risk_algo_id=risk_sync.get('algo_id'),
             okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
-            trailing_tier=0, peak_price=avg_price, peak_profit_pct=0, last_profit_pct=0
+            trailing_tier=0, peak_price=avg_price, peak_profit_pct=0, last_profit_pct=0,
+            opened_at=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            setup_class=setup_class,
+            entry_confidence=float(decision.get('confidence') or 0),
+            management_stage=0
         )
         self.db.add_trade(self.model_id, coin, 'buy_to_enter', actual_quantity, avg_price, leverage, 'long', pnl=0, gross_pnl=0, fee=entry_fee)
+        should_abort, abort_reasons = self._should_abort_post_fill_entry(
+            'long',
+            avg_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframes=market_state[coin].get('timeframes', {}),
+        )
+        if should_abort:
+            reason = '; '.join(abort_reasons[:4]) or 'post-fill guardrail violation'
+            self._debug_log(f"{coin} post-fill entry aborted: {reason}")
+            return self._abort_fresh_entry(coin, 'long', actual_quantity, market_state, reason)
         return {
             'coin': coin,
             'signal': 'buy_to_enter',
@@ -806,6 +1422,19 @@ class ExecutionService:
         self._validate_quantity(quantity, coin)
         self._validate_leverage(leverage)
         stop_loss, take_profit = self._resolve_risk_targets('short', current_price, stop_loss, take_profit)
+        pre_guardrails = self._evaluate_entry_guardrails(
+            'short',
+            current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframes=market_state[coin].get('timeframes', {}),
+            confidence=float(decision.get('confidence') or 0.60),
+        )
+        if pre_guardrails.get('hard_block'):
+            return {
+                'coin': coin,
+                'error': 'Entry rejected by guardrails: ' + '; '.join(pre_guardrails.get('reasons', [])[:3])
+            }
 
         for pos in self.okx_trader.get_positions(allow_stale=True):
             if pos['coin'] == coin:
@@ -838,6 +1467,14 @@ class ExecutionService:
         actual_quantity = actual_position.get('coin_quantity', quantity) if actual_position else quantity
         actual_contracts = actual_position.get('contracts', self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)) if actual_position else self.okx_trader.coin_quantity_to_contracts(coin, quantity, current_price)
         avg_price = actual_position.get('avg_price', current_price) if actual_position else current_price
+        setup_class = self._classify_setup_class(
+            'short',
+            float(decision.get('confidence') or 0),
+            avg_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframes=market_state[coin].get('timeframes', {}),
+        )
         risk_sync = self._sync_okx_native_risk_order(coin, side='short', contracts=actual_contracts, stop_loss=stop_loss, take_profit=take_profit)
         _, entry_fee, _ = self._extract_order_fill_details(order_status, avg_price)
         self.db.update_position(
@@ -847,9 +1484,24 @@ class ExecutionService:
             entry_fee=entry_fee,
             okx_risk_algo_id=risk_sync.get('algo_id'),
             okx_risk_algo_cl_ord_id=risk_sync.get('algo_cl_ord_id'),
-            trailing_tier=0, peak_price=avg_price, peak_profit_pct=0, last_profit_pct=0
+            trailing_tier=0, peak_price=avg_price, peak_profit_pct=0, last_profit_pct=0,
+            opened_at=datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+            setup_class=setup_class,
+            entry_confidence=float(decision.get('confidence') or 0),
+            management_stage=0
         )
         self.db.add_trade(self.model_id, coin, 'sell_to_enter', actual_quantity, avg_price, leverage, 'short', pnl=0, gross_pnl=0, fee=entry_fee)
+        should_abort, abort_reasons = self._should_abort_post_fill_entry(
+            'short',
+            avg_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframes=market_state[coin].get('timeframes', {}),
+        )
+        if should_abort:
+            reason = '; '.join(abort_reasons[:4]) or 'post-fill guardrail violation'
+            self._debug_log(f"{coin} post-fill entry aborted: {reason}")
+            return self._abort_fresh_entry(coin, 'short', actual_quantity, market_state, reason)
         return {
             'coin': coin,
             'signal': 'sell_to_enter',
@@ -872,6 +1524,7 @@ class ExecutionService:
         current_quantity = position.get('coin_quantity', 0.0)
         ai_quantity = float(decision.get('quantity', 0))
         db_pos = self.db.get_position(self.model_id, coin, position['side'])
+        management_stage_override = decision.get('_management_stage')
 
         if close_all:
             close_contracts = current_contracts
@@ -935,7 +1588,8 @@ class ExecutionService:
                 trailing_tier=db_pos.get('trailing_tier') if db_pos else 0,
                 peak_price=db_pos.get('peak_price') if db_pos else remaining_position['avg_price'],
                 peak_profit_pct=db_pos.get('peak_profit_pct') if db_pos else 0,
-                last_profit_pct=db_pos.get('last_profit_pct') if db_pos else 0
+                last_profit_pct=db_pos.get('last_profit_pct') if db_pos else 0,
+                management_stage=management_stage_override if management_stage_override is not None else db_pos.get('management_stage') if db_pos else 0
             )
             self.db.add_trade(
                 self.model_id, coin, 'reduce_position', actual_closed_quantity, fill_price,
@@ -998,6 +1652,19 @@ class ExecutionService:
             return {'coin': coin, 'error': f'{coin} 已有空仓，不能做多加仓'}
 
         stop_loss, take_profit = self._resolve_risk_targets('long', current_price, stop_loss, take_profit)
+        pre_guardrails = self._evaluate_entry_guardrails(
+            'long',
+            current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            timeframes=market_state[coin].get('timeframes', {}),
+            confidence=float(decision.get('confidence') or 0.60),
+        )
+        if pre_guardrails.get('hard_block'):
+            return {
+                'coin': coin,
+                'error': 'Add rejected by guardrails: ' + '; '.join(pre_guardrails.get('reasons', [])[:3])
+            }
         balance = self.okx_trader.get_balance(allow_stale=True)
         if 'error' in balance:
             return {'coin': coin, 'error': f'Failed to get balance: {balance["error"]}'}
@@ -1034,9 +1701,23 @@ class ExecutionService:
             trailing_tier=0,
             peak_price=max(float(db_pos.get('peak_price') or avg_price), avg_price),
             peak_profit_pct=float(db_pos.get('peak_profit_pct') or 0),
-            last_profit_pct=float(db_pos.get('last_profit_pct') or 0)
+            last_profit_pct=float(db_pos.get('last_profit_pct') or 0),
+            setup_class=db_pos.get('setup_class'),
+            entry_confidence=db_pos.get('entry_confidence'),
+            management_stage=db_pos.get('management_stage')
         )
         self.db.add_trade(self.model_id, coin, 'increase_position', quantity, current_price, leverage, 'long', pnl=0, gross_pnl=0, fee=entry_fee)
+        should_abort, abort_reasons = self._should_abort_post_fill_entry(
+            'long',
+            avg_price,
+            stop_loss=effective_stop_loss,
+            take_profit=effective_take_profit,
+            timeframes=market_state[coin].get('timeframes', {}),
+        )
+        if should_abort:
+            reason = '; '.join(abort_reasons[:4]) or 'post-fill guardrail violation'
+            self._debug_log(f"{coin} post-fill add aborted: {reason}")
+            return self._abort_added_size(coin, 'long', quantity, market_state, reason)
         return {
             'coin': coin,
             'signal': 'increase_position',

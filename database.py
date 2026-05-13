@@ -89,6 +89,10 @@ class Database:
                 peak_price REAL,
                 peak_profit_pct REAL DEFAULT 0,
                 last_profit_pct REAL DEFAULT 0,
+                opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                setup_class TEXT DEFAULT '',
+                entry_confidence REAL DEFAULT 0,
+                management_stage INTEGER DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (model_id) REFERENCES models(id),
                 UNIQUE(model_id, coin, side)
@@ -145,6 +149,22 @@ class Database:
             cursor.execute('ALTER TABLE portfolios ADD COLUMN last_profit_pct REAL DEFAULT 0')
         except:
             pass
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN opened_at TIMESTAMP')
+        except:
+            pass
+        try:
+            cursor.execute("ALTER TABLE portfolios ADD COLUMN setup_class TEXT DEFAULT ''")
+        except:
+            pass
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN entry_confidence REAL DEFAULT 0')
+        except:
+            pass
+        try:
+            cursor.execute('ALTER TABLE portfolios ADD COLUMN management_stage INTEGER DEFAULT 0')
+        except:
+            pass
         
         # Trades table
         cursor.execute('''
@@ -172,6 +192,14 @@ class Database:
 
         try:
             cursor.execute('ALTER TABLE trades ADD COLUMN fee REAL DEFAULT 0')
+        except:
+            pass
+
+        try:
+            cursor.execute("UPDATE portfolios SET opened_at = updated_at WHERE opened_at IS NULL")
+            cursor.execute("UPDATE portfolios SET setup_class = '' WHERE setup_class IS NULL")
+            cursor.execute("UPDATE portfolios SET entry_confidence = 0 WHERE entry_confidence IS NULL")
+            cursor.execute("UPDATE portfolios SET management_stage = 0 WHERE management_stage IS NULL")
         except:
             pass
 
@@ -276,20 +304,26 @@ class Database:
                        okx_risk_algo_id: str = None,
                        okx_risk_algo_cl_ord_id: str = None, trailing_tier: float = 0,
                        peak_price: float = None, peak_profit_pct: float = None,
-                       last_profit_pct: float = None):
+                       last_profit_pct: float = None, opened_at: str = None,
+                       setup_class: str = None, entry_confidence: float = None,
+                       management_stage: int = None):
         """Update position with stop loss and take profit"""
         conn = self.get_connection()
         cursor = conn.cursor()
         effective_peak_price = avg_price if peak_price is None else peak_price
         effective_peak_profit_pct = 0 if peak_profit_pct is None else peak_profit_pct
         effective_last_profit_pct = 0 if last_profit_pct is None else last_profit_pct
+        effective_setup_class = setup_class if setup_class is not None else ''
+        effective_entry_confidence = entry_confidence
+        effective_management_stage = management_stage
         cursor.execute('''
             INSERT INTO portfolios (
                 model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
                 entry_ord_id, entry_fee, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
-                peak_price, peak_profit_pct, last_profit_pct, updated_at
+                peak_price, peak_profit_pct, last_profit_pct, opened_at, setup_class,
+                entry_confidence, management_stage, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(model_id, coin, side) DO UPDATE SET
                 quantity = excluded.quantity,
                 avg_price = excluded.avg_price,
@@ -304,11 +338,23 @@ class Database:
                 peak_price = excluded.peak_price,
                 peak_profit_pct = excluded.peak_profit_pct,
                 last_profit_pct = excluded.last_profit_pct,
+                setup_class = COALESCE(NULLIF(excluded.setup_class, ''), portfolios.setup_class),
+                entry_confidence = CASE
+                    WHEN excluded.entry_confidence IS NOT NULL AND excluded.entry_confidence > 0
+                    THEN excluded.entry_confidence
+                    ELSE portfolios.entry_confidence
+                END,
+                management_stage = CASE
+                    WHEN excluded.management_stage IS NOT NULL
+                    THEN excluded.management_stage
+                    ELSE portfolios.management_stage
+                END,
                 updated_at = CURRENT_TIMESTAMP
         ''', (
             model_id, coin, quantity, avg_price, leverage, side, stop_loss, take_profit,
             entry_ord_id, 0 if entry_fee is None else entry_fee, okx_risk_algo_id, okx_risk_algo_cl_ord_id, trailing_tier,
-            effective_peak_price, effective_peak_profit_pct, effective_last_profit_pct
+            effective_peak_price, effective_peak_profit_pct, effective_last_profit_pct,
+            opened_at, effective_setup_class, effective_entry_confidence, effective_management_stage
         ))
         conn.commit()
         conn.close()
@@ -812,7 +858,8 @@ class Database:
         cursor.execute('''
             SELECT stop_loss, take_profit, entry_ord_id, okx_risk_algo_id,
                    entry_fee, okx_risk_algo_cl_ord_id, trailing_tier,
-                   peak_price, peak_profit_pct, last_profit_pct
+                   peak_price, peak_profit_pct, last_profit_pct,
+                   opened_at, setup_class, entry_confidence, management_stage
             FROM portfolios
             WHERE model_id = ? AND coin = ? AND side = ?
         ''', (model_id, coin, side))

@@ -6,6 +6,7 @@ import threading
 from datetime import datetime
 import os
 import logging
+from typing import Dict
 
 import config
 from utils.logger import setup_runtime_logging
@@ -1288,54 +1289,74 @@ def execute_trading(model_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-def trading_loop():
-    print("[INFO] 交易循环已启动")
-    
-    while auto_trading:
-        try:
-            if not trading_engines:
-                time.sleep(30) # 等待30秒，确保模型初始化完成
+def _log_cycle_results(loop_name: str, model_id: int, result: Dict):
+    if result.get('success'):
+        print(f"[OK] {loop_name} 模型 {model_id} 执行成功")
+        for exec_result in result.get('executions') or []:
+            signal = exec_result.get('signal', 'unknown')
+            coin = exec_result.get('coin', 'unknown')
+            msg = exec_result.get('message') or exec_result.get('reason') or ''
+            if signal != 'hold':
+                print(f"  [{loop_name}] {coin}: {signal} {msg}")
+    else:
+        error = result.get('error', 'Unknown error')
+        print(f"[ERROR] {loop_name} 模型 {model_id} 执行失败: {error}")
+
+
+def _run_engine_loop(loop_name: str, runner_name: str):
+    try:
+        if not trading_engines:
+            time.sleep(15)
+            return
+
+        print(f"[{loop_name}] {get_current_beijing_time_str()}")
+        print(f"[INFO] 当前交易模型数量: {len(trading_engines)}")
+
+        for model_id, engine in list(trading_engines.items()):
+            try:
+                print(f"\n[EXEC-{loop_name}] 执行模型 {model_id}")
+                runner = getattr(engine, runner_name)
+                result = runner()
+                _log_cycle_results(loop_name, model_id, result)
+            except Exception as e:
+                print(f"[ERROR] {loop_name} 模型 {model_id} 异常: {e}")
+                import traceback
+                print(traceback.format_exc())
                 continue
-            
-            print(f"[CYCLE] {get_current_beijing_time_str()}")  # 日志显示东八区时间
-            print(f"[INFO] 当前交易模型数量: {len(trading_engines)}")
-            
-            for model_id, engine in list(trading_engines.items()):
-                try:
-                    print(f"\n[EXEC] 执行模型交易 {model_id}")
-                    result = engine.execute_trading_cycle()
-                    
-                    if result.get('success'):
-                        print(f"[OK] 模型 {model_id} 执行成功")
-                        if result.get('executions'):
-                            for exec_result in result['executions']:
-                                signal = exec_result.get('signal', 'unknown')
-                                coin = exec_result.get('coin', 'unknown')
-                                msg = exec_result.get('message', '')
-                                if signal != 'hold':
-                                    print(f"  [TRADE] {coin}: {msg}")
-                    else:
-                        error = result.get('error', 'Unknown error')
-                        print(f"[ERROR] 模型 {model_id} 执行失败: {error}")
-                        
-                except Exception as e:
-                    print(f"[ERROR] 模型 {model_id} 异常: {e}")
-                    import traceback
-                    print(traceback.format_exc())
-                    continue
-            print(f"[SLEEP] 等待三分钟进行下次交易")
-            
-            trading_interval = int(os.getenv('TRADING_INTERVAL', '180'))
-            time.sleep(trading_interval)
-            
-        except Exception as e:
-            print(f"\n[CRITICAL] 交易循环异常: {e}")
-            import traceback
-            print(traceback.format_exc())
-            print("[RETRY] 60秒后重试\n")
-            time.sleep(60) # 等待60秒，确保模型执行完成
-    
-    print("[INFO] 交易循环已停止")
+    except Exception as e:
+        print(f"\n[CRITICAL] {loop_name} 循环异常: {e}")
+        import traceback
+        print(traceback.format_exc())
+        print("[RETRY] 60秒后重试\n")
+        time.sleep(60)
+
+
+def _sleep_until_next_ai_cycle():
+    interval = max(int(config.AI_DECISION_INTERVAL), 60)
+    offset_seconds = 5
+    now = time.time()
+    next_run = ((int(now) // interval) + 1) * interval + offset_seconds
+    sleep_seconds = max(1, next_run - now)
+    print(f"[SLEEP] AI 决策等待 {sleep_seconds:.0f} 秒后进入下一轮")
+    time.sleep(sleep_seconds)
+
+
+def ai_decision_loop():
+    print("[INFO] AI 决策循环已启动")
+    while auto_trading:
+        _run_engine_loop('AI', 'execute_trading_cycle')
+        _sleep_until_next_ai_cycle()
+    print("[INFO] AI 决策循环已停止")
+
+
+def risk_monitor_loop():
+    print("[INFO] 风控循环已启动")
+    interval = max(int(config.RISK_CHECK_INTERVAL), 15)
+    while auto_trading:
+        _run_engine_loop('RISK', 'execute_risk_cycle')
+        print(f"[SLEEP] 风控等待 {interval} 秒后进入下一轮")
+        time.sleep(interval)
+    print("[INFO] 风控循环已停止")
 
 
 
@@ -1371,8 +1392,10 @@ if __name__ == '__main__':
     init_trading_engines()
     
     if auto_trading:
-        trading_thread = threading.Thread(target=trading_loop, daemon=True)
-        trading_thread.start()
+        ai_thread = threading.Thread(target=ai_decision_loop, daemon=True)
+        risk_thread = threading.Thread(target=risk_monitor_loop, daemon=True)
+        ai_thread.start()
+        risk_thread.start()
     
     print(f"Server: http://localhost:{config.PORT}")
 

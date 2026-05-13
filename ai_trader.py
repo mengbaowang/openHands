@@ -9,6 +9,106 @@ class AITrader:
         self.api_url = api_url
         self.model_name = model_name
         self.system_prompt = system_prompt or self._get_default_prompt()
+
+    def _classify_regime(self, indicators: Dict) -> str:
+        if not indicators:
+            return 'unknown'
+
+        current_price = float(indicators.get('current_price', 0) or 0)
+        sma5 = float(indicators.get('sma_5', 0) or 0)
+        sma14 = float(indicators.get('sma_14', 0) or 0)
+        sma30 = float(indicators.get('sma_30', 0) or 0)
+        rsi = float(indicators.get('rsi_14', 50) or 50)
+        macd_hist = float(indicators.get('macd_histogram', 0) or 0)
+
+        if sma14 > 0 and current_price > sma14 and macd_hist > 0 and rsi >= 60:
+            if sma30 > 0 and current_price > sma30 and rsi >= 68 and sma5 >= sma14:
+                return 'strong_bull'
+            return 'weak_bull'
+        if sma14 > 0 and current_price < sma14 and macd_hist < 0 and rsi <= 40:
+            if sma30 > 0 and current_price < sma30 and rsi <= 35 and sma5 <= sma14:
+                return 'strong_bear'
+            return 'weak_bear'
+        if sma14 > 0 and current_price < sma14 and macd_hist < 0 and rsi < 48:
+            return 'weak_bear'
+        if sma14 > 0 and current_price > sma14 and macd_hist > 0 and rsi > 52:
+            return 'weak_bull'
+        return 'neutral'
+
+    def _timeframe_has_restart_confirmation(self, side: str, indicators: Dict) -> bool:
+        if not indicators:
+            return False
+
+        current_price = float(indicators.get('current_price', 0) or 0)
+        sma5 = float(indicators.get('sma_5', 0) or 0)
+        sma14 = float(indicators.get('sma_14', 0) or 0)
+        rsi = float(indicators.get('rsi_14', 50) or 50)
+        macd_hist = float(indicators.get('macd_histogram', 0) or 0)
+        volume_ratio = float(indicators.get('volume_ratio', 0) or 0)
+
+        score = 0
+        if side == 'long':
+            if macd_hist > 0:
+                score += 1
+            if sma5 > 0 and current_price > sma5:
+                score += 1
+            if sma14 > 0 and current_price >= sma14 * 0.998:
+                score += 1
+            if rsi >= 52:
+                score += 1
+            if volume_ratio >= 0.80:
+                score += 1
+            return score >= 3 and macd_hist > 0 and sma5 > 0 and current_price > sma5
+
+        if macd_hist < 0:
+            score += 1
+        if sma5 > 0 and current_price < sma5:
+            score += 1
+        if sma14 > 0 and current_price <= sma14 * 1.002:
+            score += 1
+        if rsi <= 48:
+            score += 1
+        if volume_ratio >= 0.80:
+            score += 1
+        return score >= 3 and macd_hist < 0 and sma5 > 0 and current_price < sma5
+
+    def _room_to_extreme(self, current_price: float, indicators: Dict, direction: str) -> float:
+        current_price = float(current_price or 0)
+        if current_price <= 0 or not indicators:
+            return 0.0
+        if direction == 'long':
+            extreme = float(indicators.get('recent_high_20', 0) or 0)
+            room = max(0.0, extreme - current_price) if extreme > 0 else 0.0
+        else:
+            extreme = float(indicators.get('recent_low_20', 0) or 0)
+            room = max(0.0, current_price - extreme) if extreme > 0 else 0.0
+        return room / current_price if current_price > 0 else 0.0
+
+    def _classify_long_setup_class(self, timeframes: Dict) -> str:
+        tf_1h = (timeframes or {}).get('1h', {}) or {}
+        tf_15m = (timeframes or {}).get('15m', {}) or {}
+        tf_5m = (timeframes or {}).get('5m', {}) or {}
+        regime_1h = self._classify_regime(tf_1h)
+        restart_15m = self._timeframe_has_restart_confirmation('long', tf_15m)
+        restart_5m = self._timeframe_has_restart_confirmation('long', tf_5m)
+        current_price = float(tf_5m.get('current_price', tf_15m.get('current_price', tf_1h.get('current_price', 0))) or 0)
+        room_pct = min(
+            [value for value in (
+                self._room_to_extreme(current_price, tf_15m, 'long'),
+                self._room_to_extreme(current_price, tf_1h, 'long'),
+            ) if value > 0] or [0.0]
+        )
+        volume_ok = float(tf_15m.get('volume_ratio', 0) or 0) >= 0.80 and float(tf_5m.get('volume_ratio', 0) or 0) >= 0.80
+
+        if regime_1h in {'weak_bear', 'strong_bear'}:
+            if restart_5m and room_pct >= 0.003:
+                return 'C'
+            return 'D'
+        if restart_15m and restart_5m and volume_ok and room_pct >= 0.004:
+            return 'A'
+        if restart_5m and room_pct >= 0.003:
+            return 'B'
+        return 'D'
     
     def make_decision(self, market_state: Dict, portfolio: Dict,
                      account_info: Dict) -> tuple:
@@ -76,6 +176,23 @@ MARKET DATA:
                     f"Low20=${indicators.get('recent_low_20', 0):.2f}, "
                     f"MACD_hist_tail={indicators.get('macd_histogram_tail', [])}\n"
                 )
+            regime_1h = self._classify_regime(timeframes.get('1h', {}) or {})
+            long_restart_15m = self._timeframe_has_restart_confirmation('long', timeframes.get('15m', {}) or {})
+            long_restart_5m = self._timeframe_has_restart_confirmation('long', timeframes.get('5m', {}) or {})
+            long_setup_class = self._classify_long_setup_class(timeframes)
+            rebound_long_risk = (
+                'high'
+                if regime_1h in {'weak_bear', 'strong_bear'} and not (long_restart_15m and long_restart_5m)
+                else 'medium' if regime_1h in {'weak_bear', 'strong_bear'}
+                else 'normal'
+            )
+            prompt += (
+                f"  Context: 1H_regime={regime_1h}, "
+                f"long_restart_15m={'yes' if long_restart_15m else 'no'}, "
+                f"long_restart_5m={'yes' if long_restart_5m else 'no'}, "
+                f"program_long_setup_class={long_setup_class}, "
+                f"rebound_long_risk={rebound_long_risk}\n"
+            )
         
         prompt += f"""
 ACCOUNT STATUS:
@@ -94,6 +211,9 @@ CURRENT POSITIONS:
                     f"net_profit={float(pos.get('last_profit_pct') or 0) * 100:.2f}%, "
                     f"peak_net_profit={float(pos.get('peak_profit_pct') or 0) * 100:.2f}%, "
                     f"peak_price=${float(pos.get('peak_price') or pos['avg_price']):.2f}, "
+                    f"setup_class={pos.get('setup_class', '')}, "
+                    f"holding_minutes={float(pos.get('holding_minutes') or 0):.0f}, "
+                    f"management_stage={int(pos.get('management_stage') or 0)}, "
                     f"stop_loss=${float(pos.get('stop_loss') or 0):.2f}, "
                     f"take_profit=${float(pos.get('take_profit') or 0):.2f}\n"
                 )
@@ -106,6 +226,12 @@ EXECUTION RULES YOU MUST RESPECT:
 - Do not assume missing data. If 1H/15M/5M alignment or RR cannot be justified from the supplied data, prefer `hold`.
 - Use the supplied net profit percentages as the source of truth for position profit state.
 - If a setup is only marginally valid, near short-term resistance/support, or already overextended, explicitly reduce quantity rather than using a normal-sized entry.
+- If `1H_regime` is `weak_bear` or `strong_bear`, treat any `buy_to_enter` as a countertrend rebound. In that case, do not buy only because RSI is oversold.
+- In countertrend rebound longs, require both `long_restart_15m=yes` and `long_restart_5m=yes`, non-weak volume, and a comfortably positive RR after fees. Otherwise prefer `hold`.
+- If an existing losing long keeps moving toward its stop while 1H/15M/5M remain weak, prefer `reduce_position` or `sell_to_close` over passive `hold`.
+- Treat `program_long_setup_class` as a strong prior:
+  `A` = high quality continuation, `B` = medium quality continuation, `C` = countertrend rebound, `D` = do not open.
+- When a current position shows `setup_class=B` or `setup_class=C`, prefer earlier profit protection, partial reductions, and time-sensitive exits over optimistic holding.
 
 OUTPUT FORMAT (JSON only):
 ```json
@@ -402,6 +528,12 @@ B. 趋势延续轻仓开仓
 - 如果已有仓位且趋势未破，优先 hold，让引擎管理止损和利润保护
 - 如果已有仓位且 15M/5M 明显转弱，可以 reduce_position
 - 只有在已有盈利、趋势延续明确、且当前不是边际位置时，才允许 increase_position
+
+Additional weak-market rebound rules:
+- If the 1H regime is weak_bear or strong_bear, any long entry is a countertrend rebound by default.
+- Never justify a countertrend long with oversold RSI alone.
+- Countertrend rebound longs require both 15M and 5M restart confirmation, non-weak volume, and comfortably positive post-cost RR. Otherwise hold.
+- If an existing losing long keeps moving toward stop-loss while 1H, 15M, and 5M all remain weak, prefer reduce_position or sell_to_close instead of passive hold.
 
 六、输出要求
 只输出 JSON，不要输出任何额外解释。

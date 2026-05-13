@@ -15,7 +15,10 @@ DATABASE_PATH = os.getenv('DATABASE_PATH', 'trading_bot.db')
 
 # ============ 交易配置 ============
 AUTO_TRADING = os.getenv('AUTO_TRADING', 'True').lower() == 'true'
-TRADING_INTERVAL = int(os.getenv('TRADING_INTERVAL', 180))  # 秒
+# Deprecated alias kept for backward compatibility.
+TRADING_INTERVAL = int(os.getenv('TRADING_INTERVAL', 300))
+AI_DECISION_INTERVAL = int(os.getenv('AI_DECISION_INTERVAL', TRADING_INTERVAL))
+RISK_CHECK_INTERVAL = int(os.getenv('RISK_CHECK_INTERVAL', 60))
 
 # 支持的币种列表（仅 OKX）
 SUPPORTED_COINS = ['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE', 'ZEC']

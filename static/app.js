@@ -4,10 +4,18 @@ class TradingApp {
         const appConfig = window.APP_CONFIG || {};
         this.currentModelId = null;
         this.currentUser = null;
+        this.models = [];
         this.chart = null;
         this.klineChart = null;
         this.currentKlineCoin = 'BTC';
         this.klineColorMode = 'red-up'; // 默认红涨绿跌
+        this.currentModel = null;
+        this.backtestChart = null;
+        this.backtestResult = null;
+        this.backtestHistory = [];
+        this.currentBacktestJobId = null;
+        this.backtestPollTimer = null;
+        this.isRunningBacktest = false;
         this.marketRefreshInterval = Number(appConfig.market_refresh_interval) || 15000;
         this.portfolioRefreshInterval = Number(appConfig.portfolio_refresh_interval) || 30000;
         this.positionPnlRefreshInterval = Number(appConfig.position_pnl_refresh_interval) || 5000;
@@ -153,6 +161,223 @@ class TradingApp {
         return true;
     }
 
+    initBacktestDefaults() {
+        const startInput = document.getElementById('backtestStartDate');
+        const endInput = document.getElementById('backtestEndDate');
+        const today = new Date();
+        const ninetyDaysAgo = new Date(today);
+        ninetyDaysAgo.setDate(today.getDate() - 90);
+
+        if (startInput && !startInput.value) {
+            startInput.value = this.formatDateInput(ninetyDaysAgo);
+        }
+        if (endInput && !endInput.value) {
+            endInput.value = this.formatDateInput(today);
+        }
+        this.applyBacktestPreset(90);
+        this.toggleBacktestExportButtons(false);
+    }
+
+    applyModelDefaultsToBacktest() {
+        const capitalInput = document.getElementById('backtestInitialCapital');
+        if (capitalInput && this.currentModel && this.currentModel.initial_capital !== undefined) {
+            capitalInput.value = Number(this.currentModel.initial_capital || 10000);
+        }
+
+        this.backtestHistory = this.readBacktestHistory();
+        this.renderBacktestHistory();
+        this.loadLatestBacktestJob();
+        this.loadBacktestJobs();
+
+        const statusEl = document.getElementById('backtestStatus');
+        if (statusEl && this.currentModel) {
+            statusEl.textContent = `当前模型：${this.currentModel.name}，你可以直接运行近90天回测，或调整参数后再跑。`;
+        }
+    }
+
+    formatDateInput(date) {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    }
+
+    formatCurrency(value, digits = 2) {
+        const numeric = Number(value || 0);
+        return `${numeric >= 0 ? '$' : '-$'}${Math.abs(numeric).toFixed(digits)}`;
+    }
+
+    formatPercent(value, digits = 2) {
+        const numeric = Number(value || 0);
+        return `${numeric >= 0 ? '' : '-'}${Math.abs(numeric).toFixed(digits)}%`;
+    }
+
+    formatInteger(value) {
+        return Number(value || 0).toLocaleString('zh-CN');
+    }
+
+    async parseJsonResponse(response) {
+        const contentType = response.headers.get('content-type') || '';
+        const text = await response.text();
+        if (!contentType.includes('application/json')) {
+            const snippet = text.slice(0, 120).replace(/\s+/g, ' ').trim();
+            throw new Error(`后端没有返回 JSON，当前返回的是 ${contentType || 'unknown'}。通常是服务未重启或接口不存在。${snippet ? ` 响应片段: ${snippet}` : ''}`);
+        }
+        try {
+            return JSON.parse(text);
+        } catch (error) {
+            throw new Error(`后端 JSON 解析失败：${error.message}`);
+        }
+    }
+
+    getBacktestHistoryKey() {
+        return this.currentModelId ? `dashboard:backtest_history:${this.currentModelId}` : 'dashboard:backtest_history';
+    }
+
+    readBacktestHistory() {
+        if (!this.currentModelId) return [];
+        try {
+            const rawValue = localStorage.getItem(this.getBacktestHistoryKey());
+            const parsed = rawValue ? JSON.parse(rawValue) : [];
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (error) {
+            console.warn('Failed to read backtest history:', error);
+            return [];
+        }
+    }
+
+    writeBacktestHistory(history) {
+        if (!this.currentModelId) return;
+        try {
+            localStorage.setItem(this.getBacktestHistoryKey(), JSON.stringify(history));
+        } catch (error) {
+            console.warn('Failed to write backtest history:', error);
+        }
+    }
+
+    stopBacktestPolling() {
+        if (this.backtestPollTimer) {
+            clearInterval(this.backtestPollTimer);
+            this.backtestPollTimer = null;
+        }
+    }
+
+    startBacktestPolling(jobId) {
+        this.stopBacktestPolling();
+        this.currentBacktestJobId = jobId;
+        this.backtestPollTimer = setInterval(() => {
+            this.pollBacktestJob(jobId);
+        }, 3000);
+        this.pollBacktestJob(jobId);
+    }
+
+    async loadLatestBacktestJob() {
+        if (!this.currentModelId) return;
+        this.stopBacktestPolling();
+        this.currentBacktestJobId = null;
+        try {
+            const response = await fetch(`/api/models/${this.currentModelId}/backtest-jobs/latest`, {
+                credentials: 'include'
+            });
+            if (!response.ok) return;
+            const job = await this.parseJsonResponse(response);
+            if (!job || !job.id) {
+                this.clearBacktestResults({ keepStatus: false });
+                return;
+            }
+            this.currentBacktestJobId = job.id;
+            if (job.status === 'completed' && job.result) {
+                this.backtestResult = job.result;
+                this.renderBacktestResult(job.result);
+                const statusEl = document.getElementById('backtestStatus');
+                if (statusEl) statusEl.textContent = job.message || '最近一次回测已完成。';
+            } else if (['queued', 'running'].includes(job.status)) {
+                this.setBacktestRunning(true);
+                const statusEl = document.getElementById('backtestStatus');
+                if (statusEl) {
+                    statusEl.textContent = `${job.message || '回测进行中'} (${Math.round(Number(job.progress || 0))}%)`;
+                }
+                this.startBacktestPolling(job.id);
+            } else if (job.status === 'failed') {
+                const statusEl = document.getElementById('backtestStatus');
+                if (statusEl) statusEl.textContent = `最近一次回测失败：${job.error || job.message || '未知错误'}`;
+            }
+        } catch (error) {
+            console.warn('Failed to load latest backtest job:', error);
+        }
+    }
+
+    async loadBacktestJobs() {
+        if (!this.currentModelId) return;
+        try {
+            const response = await fetch(`/api/models/${this.currentModelId}/backtest-jobs?limit=20`, {
+                credentials: 'include'
+            });
+            if (!response.ok) return;
+            const jobs = await this.parseJsonResponse(response);
+            this.renderBacktestJobs(Array.isArray(jobs) ? jobs : []);
+        } catch (error) {
+            console.warn('Failed to load backtest jobs:', error);
+        }
+    }
+
+    renderBacktestJobs(jobs) {
+        const tbody = document.getElementById('backtestJobsBody');
+        if (!tbody) return;
+        if (!jobs.length) {
+            tbody.innerHTML = '<tr><td colspan="6" class="empty-state">暂无任务</td></tr>';
+            return;
+        }
+
+        const modeMap = {
+            full_ai: '完整AI',
+            candidate_ai: '候选AI',
+            fast_rule: '快速规则'
+        };
+        const statusMap = {
+            queued: '排队中',
+            running: '运行中',
+            completed: '已完成',
+            failed: '失败'
+        };
+
+        tbody.innerHTML = jobs.map((job) => {
+            const status = job.status || 'queued';
+            const statusClass = status === 'completed'
+                ? 'text-success'
+                : status === 'failed'
+                    ? 'text-danger'
+                    : status === 'running'
+                        ? 'text-info'
+                        : 'text-warning';
+            return `
+                <tr>
+                    <td>${new Date(job.created_at).toLocaleString('zh-CN')}</td>
+                    <td>${modeMap[job.mode] || job.mode}</td>
+                    <td>${job.start_date} ~ ${job.end_date}</td>
+                    <td class="${statusClass}">${statusMap[status] || status}</td>
+                    <td>${Math.round(Number(job.progress || 0))}%</td>
+                    <td>${job.error || job.message || '-'}</td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    applyBacktestPreset(days) {
+        const endInput = document.getElementById('backtestEndDate');
+        const startInput = document.getElementById('backtestStartDate');
+        const endDate = endInput?.value ? new Date(`${endInput.value}T00:00:00`) : new Date();
+        const startDate = new Date(endDate);
+        startDate.setDate(endDate.getDate() - Number(days || 90));
+
+        if (startInput) startInput.value = this.formatDateInput(startDate);
+        if (endInput && !endInput.value) endInput.value = this.formatDateInput(endDate);
+
+        document.querySelectorAll('.backtest-preset-btn').forEach((btn) => {
+            btn.classList.toggle('active', Number(btn.dataset.days || 0) === Number(days));
+        });
+    }
+
     cacheModelData(modelId, snapshot) {
         this.writeCache(this.getCacheKey('model_snapshot', modelId), snapshot);
     }
@@ -165,6 +390,18 @@ class TradingApp {
         document.getElementById('refreshBtn').addEventListener('click', () => this.refresh());
         document.getElementById('themeToggle').addEventListener('click', () => this.toggleTheme());
         document.getElementById('logoutBtn').addEventListener('click', () => this.logout());
+        const runBacktestBtn = document.getElementById('runBacktestBtn');
+        const backtestResetBtn = document.getElementById('backtestResetBtn');
+        const exportBacktestJsonBtn = document.getElementById('exportBacktestJsonBtn');
+        const exportBacktestCsvBtn = document.getElementById('exportBacktestCsvBtn');
+        if (runBacktestBtn) runBacktestBtn.addEventListener('click', () => this.submitBacktestJob());
+        if (backtestResetBtn) backtestResetBtn.addEventListener('click', () => this.resetBacktestPanel());
+        if (exportBacktestJsonBtn) exportBacktestJsonBtn.addEventListener('click', () => this.exportBacktest('json'));
+        if (exportBacktestCsvBtn) exportBacktestCsvBtn.addEventListener('click', () => this.exportBacktest('csv'));
+
+        document.querySelectorAll('.backtest-preset-btn').forEach((btn) => {
+            btn.addEventListener('click', () => this.applyBacktestPreset(Number(btn.dataset.days || 90)));
+        });
 
         document.querySelectorAll('.tab-btn').forEach(btn => {
             btn.addEventListener('click', (e) => this.switchTab(e.target.dataset.tab));
@@ -250,8 +487,9 @@ class TradingApp {
             }
 
             const models = await response.json();
+            this.models = Array.isArray(models) ? models : [];
             this.renderModels(models);
-            return Array.isArray(models) ? models : [];
+            return this.models;
         } catch (error) {
             console.error('Failed to load models:', error);
             return [];
@@ -291,6 +529,9 @@ class TradingApp {
         const { useCache = true, refreshModels = true } = options;
         if (!modelId) return;
 
+        if (this.currentModelId !== modelId) {
+            this.clearBacktestResults({ keepStatus: false });
+        }
         this.currentModelId = modelId;
         this.saveSelectedModelId(modelId);
 
@@ -300,6 +541,9 @@ class TradingApp {
                 this.renderModels(models);
             }
         }
+
+        this.currentModel = (this.models || []).find(model => model.id === modelId) || null;
+        this.applyModelDefaultsToBacktest();
 
         if (useCache) {
             this.restoreCachedModelData(modelId);
@@ -1007,6 +1251,560 @@ class TradingApp {
         return result;
     }
 
+    resetBacktestPanel() {
+        this.stopBacktestPolling();
+        this.currentBacktestJobId = null;
+        this.initBacktestDefaults();
+        this.applyModelDefaultsToBacktest();
+        const decisionInterval = document.getElementById('backtestDecisionInterval');
+        const riskInterval = document.getElementById('backtestRiskInterval');
+        const maxAiCalls = document.getElementById('backtestMaxAiCalls');
+        const mode = document.getElementById('backtestMode');
+        if (decisionInterval) decisionInterval.value = '3600';
+        if (riskInterval) riskInterval.value = '300';
+        if (maxAiCalls) maxAiCalls.value = '2000';
+        if (mode) mode.value = 'candidate_ai';
+        this.clearBacktestResults({ keepStatus: false });
+    }
+
+    clearBacktestResults(options = {}) {
+        const { keepStatus = false } = options;
+        this.backtestResult = null;
+        const emptyState = document.getElementById('backtestEmptyState');
+        const results = document.getElementById('backtestResults');
+        const meta = document.getElementById('backtestRunMeta');
+        const coinStatsBody = document.getElementById('backtestCoinStatsBody');
+        const tradesBody = document.getElementById('backtestTradesBody');
+
+        if (emptyState) emptyState.classList.remove('hidden');
+        if (results) results.classList.add('hidden');
+        if (meta) meta.textContent = '';
+        if (coinStatsBody) coinStatsBody.innerHTML = '<tr><td colspan="5" class="empty-state">暂无数据</td></tr>';
+        if (tradesBody) tradesBody.innerHTML = '<tr><td colspan="5" class="empty-state">暂无数据</td></tr>';
+        this.toggleBacktestExportButtons(false);
+
+        document.querySelectorAll('[data-metric]').forEach((el) => {
+            el.textContent = '--';
+            el.classList.remove('positive', 'negative');
+        });
+
+        if (this.backtestChart) {
+            this.backtestChart.clear();
+        }
+
+        if (!keepStatus) {
+            const statusEl = document.getElementById('backtestStatus');
+            if (statusEl) {
+                statusEl.textContent = this.currentModel
+                    ? `当前模型：${this.currentModel.name}，你可以直接运行近90天回测，或调整参数后再跑。`
+                    : '请选择模型后再运行回测。';
+            }
+        }
+    }
+
+    setBacktestRunning(isRunning) {
+        this.isRunningBacktest = isRunning;
+        const runBtn = document.getElementById('runBacktestBtn');
+        const resetBtn = document.getElementById('backtestResetBtn');
+        if (runBtn) {
+            runBtn.disabled = isRunning;
+            runBtn.innerHTML = isRunning
+                ? '<i class="bi bi-hourglass-split"></i> 回测中...'
+                : '<i class="bi bi-play-fill"></i> 运行回测';
+        }
+        if (resetBtn) {
+            resetBtn.disabled = isRunning;
+        }
+        this.toggleBacktestExportButtons(!isRunning && !!this.backtestResult);
+    }
+
+    toggleBacktestExportButtons(enabled) {
+        ['exportBacktestJsonBtn', 'exportBacktestCsvBtn'].forEach((id) => {
+            const btn = document.getElementById(id);
+            if (btn) btn.disabled = !enabled;
+        });
+    }
+
+    async runBacktest() {
+        if (!this.currentModelId) {
+            alert('请先选择一个模型再运行回测');
+            return;
+        }
+        if (this.isRunningBacktest) {
+            return;
+        }
+
+        const startDate = document.getElementById('backtestStartDate')?.value;
+        const endDate = document.getElementById('backtestEndDate')?.value;
+        const initialCapital = Number(document.getElementById('backtestInitialCapital')?.value || 0);
+        const decisionInterval = Number(document.getElementById('backtestDecisionInterval')?.value || 3600);
+        const riskInterval = Number(document.getElementById('backtestRiskInterval')?.value || 300);
+        const maxAiCalls = Number(document.getElementById('backtestMaxAiCalls')?.value || 2000);
+
+        if (!startDate || !endDate) {
+            alert('请选择回测开始和结束日期');
+            return;
+        }
+        if (startDate > endDate) {
+            alert('开始日期不能晚于结束日期');
+            return;
+        }
+        if (!Number.isFinite(initialCapital) || initialCapital <= 0) {
+            alert('初始资金必须大于 0');
+            return;
+        }
+        if (!Number.isFinite(maxAiCalls) || maxAiCalls <= 0) {
+            alert('最大AI调用数必须大于 0');
+            return;
+        }
+
+        const statusEl = document.getElementById('backtestStatus');
+        if (statusEl) {
+            statusEl.textContent = '正在拉取历史数据并回放AI决策，这一步可能需要一些时间，请稍候...';
+        }
+
+        this.setBacktestRunning(true);
+
+        try {
+            const response = await fetch('/api/backtest', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model_id: this.currentModelId,
+                    start_date: startDate,
+                    end_date: endDate,
+                    initial_capital: initialCapital,
+                    decision_interval_seconds: decisionInterval,
+                    risk_interval_seconds: riskInterval,
+                    max_ai_calls: maxAiCalls
+                })
+            });
+
+            const result = await response.json();
+            if (!response.ok) {
+                throw new Error(result.error || '回测失败');
+            }
+
+            this.backtestResult = result;
+            this.renderBacktestResult(result);
+            this.saveBacktestHistoryEntry(result);
+            if (statusEl) {
+                statusEl.textContent = `回测完成：${result.start_date} 至 ${result.end_date}，共回放 ${this.formatInteger(result.summary?.decision_cycles || 0)} 次AI决策周期。`;
+            }
+        } catch (error) {
+            console.error('Backtest failed:', error);
+            if (statusEl) {
+                statusEl.textContent = `回测失败：${error.message}`;
+            }
+            alert(error.message || '回测失败');
+        } finally {
+            this.setBacktestRunning(false);
+        }
+    }
+
+    renderBacktestResult(result) {
+        const emptyState = document.getElementById('backtestEmptyState');
+        const results = document.getElementById('backtestResults');
+        if (emptyState) emptyState.classList.add('hidden');
+        if (results) results.classList.remove('hidden');
+        this.toggleBacktestExportButtons(true);
+
+        const metrics = result.metrics || {};
+        const summaryMetrics = {
+            total_return: { value: this.formatPercent(metrics.total_return), numeric: Number(metrics.total_return || 0) },
+            total_net_pnl: { value: this.formatCurrency(metrics.total_net_pnl), numeric: Number(metrics.total_net_pnl || 0) },
+            win_rate: { value: this.formatPercent(metrics.win_rate), numeric: Number(metrics.win_rate || 0) },
+            total_fees: { value: this.formatCurrency(metrics.total_fees), numeric: -Math.abs(Number(metrics.total_fees || 0)) },
+            entry_count: { value: this.formatInteger(metrics.entry_count), numeric: 0 },
+            max_drawdown: { value: this.formatPercent((metrics.max_drawdown || 0) * 100), numeric: -Math.abs(Number(metrics.max_drawdown || 0)) }
+        };
+
+        document.querySelectorAll('[data-metric]').forEach((el) => {
+            const key = el.dataset.metric;
+            const item = summaryMetrics[key];
+            if (!item) return;
+            el.textContent = item.value;
+            el.classList.remove('positive', 'negative');
+            if (item.numeric > 0 && key !== 'entry_count') el.classList.add('positive');
+            if (item.numeric < 0) el.classList.add('negative');
+        });
+
+        const meta = document.getElementById('backtestRunMeta');
+        if (meta) {
+            const settings = result.settings || {};
+            meta.textContent = `AI周期 ${this.formatInteger(settings.effective_decision_interval_seconds || 0)} 秒 · 风控周期 ${this.formatInteger(settings.effective_risk_interval_seconds || 0)} 秒 · 结束资金 ${this.formatCurrency(result.final_value || 0)}`;
+        }
+
+        this.renderBacktestChart(result.daily_values || []);
+        this.renderBacktestCoinStats(metrics.coin_stats || []);
+        this.renderBacktestTrades(result.trades || []);
+        this.renderBacktestHistory();
+    }
+
+    renderBacktestChart(dailyValues) {
+        const chartDom = document.getElementById('backtestChart');
+        if (!chartDom) return;
+
+        if (!this.backtestChart) {
+            this.backtestChart = echarts.init(chartDom);
+            window.addEventListener('resize', () => {
+                if (this.backtestChart) this.backtestChart.resize();
+            });
+        }
+
+        const data = (dailyValues || []).map((item) => ({
+            date: item.date,
+            value: Number(item.total_value || 0)
+        }));
+
+        this.backtestChart.setOption({
+            grid: { left: 56, right: 20, top: 20, bottom: 35 },
+            tooltip: {
+                trigger: 'axis',
+                formatter: (params) => {
+                    const point = params?.[0];
+                    if (!point) return '';
+                    return `${point.axisValue}<br>${this.formatCurrency(point.value)}`;
+                }
+            },
+            xAxis: {
+                type: 'category',
+                data: data.map((item) => item.date),
+                axisLabel: { color: '#86909c' },
+                axisLine: { lineStyle: { color: '#c9cdd4' } }
+            },
+            yAxis: {
+                type: 'value',
+                scale: true,
+                axisLabel: {
+                    color: '#86909c',
+                    formatter: (value) => `$${Number(value).toLocaleString('zh-CN')}`
+                },
+                splitLine: { lineStyle: { color: '#f2f3f5' } }
+            },
+            series: [{
+                type: 'line',
+                data: data.map((item) => item.value),
+                smooth: true,
+                symbol: 'none',
+                lineStyle: { color: '#165dff', width: 2.5 },
+                areaStyle: {
+                    color: {
+                        type: 'linear',
+                        x: 0, y: 0, x2: 0, y2: 1,
+                        colorStops: [
+                            { offset: 0, color: 'rgba(22, 93, 255, 0.22)' },
+                            { offset: 1, color: 'rgba(22, 93, 255, 0.02)' }
+                        ]
+                    }
+                }
+            }]
+        });
+    }
+
+    renderBacktestCoinStats(coinStats) {
+        const tbody = document.getElementById('backtestCoinStatsBody');
+        if (!tbody) return;
+        if (!coinStats.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="empty-state">暂无数据</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = coinStats.map((item) => {
+            const netPnl = Number(item.net_pnl || 0);
+            const pnlClass = netPnl > 0 ? 'text-success' : netPnl < 0 ? 'text-danger' : '';
+            return `
+                <tr>
+                    <td><strong>${item.coin}</strong></td>
+                    <td>${this.formatInteger(item.trades)}</td>
+                    <td>${this.formatPercent(item.win_rate)}</td>
+                    <td class="${pnlClass}">${this.formatCurrency(netPnl)}</td>
+                    <td>${this.formatCurrency(item.fees)}</td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    renderBacktestTrades(trades) {
+        const tbody = document.getElementById('backtestTradesBody');
+        if (!tbody) return;
+
+        const displayTrades = (trades || [])
+            .filter((trade) => ['buy_to_enter', 'sell_to_enter', 'increase_position', 'reduce_position', 'close_position', 'fixed_stop', 'take_profit'].includes(trade.signal))
+            .slice(-12)
+            .reverse();
+
+        if (!displayTrades.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="empty-state">暂无数据</td></tr>';
+            return;
+        }
+
+        const signalMap = {
+            buy_to_enter: '开多',
+            sell_to_enter: '开空',
+            increase_position: '加仓',
+            reduce_position: '减仓',
+            close_position: '平仓',
+            fixed_stop: '止损',
+            take_profit: '止盈'
+        };
+
+        tbody.innerHTML = displayTrades.map((trade) => {
+            const pnl = Number(trade.pnl || 0);
+            const pnlClass = pnl > 0 ? 'text-success' : pnl < 0 ? 'text-danger' : '';
+            return `
+                <tr>
+                    <td>${trade.timestamp}</td>
+                    <td><strong>${trade.coin || '-'}</strong></td>
+                    <td>${signalMap[trade.signal] || trade.signal}</td>
+                    <td>${this.formatCurrency(trade.price || 0)}</td>
+                    <td class="${pnlClass}">${this.formatCurrency(pnl)}</td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    async submitBacktestJob() {
+        if (!this.currentModelId) {
+            alert('请先选择一个模型再运行回测');
+            return;
+        }
+        if (this.isRunningBacktest) {
+            return;
+        }
+
+        const startDate = document.getElementById('backtestStartDate')?.value;
+        const endDate = document.getElementById('backtestEndDate')?.value;
+        const initialCapital = Number(document.getElementById('backtestInitialCapital')?.value || 0);
+        const decisionInterval = Number(document.getElementById('backtestDecisionInterval')?.value || 3600);
+        const riskInterval = Number(document.getElementById('backtestRiskInterval')?.value || 300);
+        const maxAiCalls = Number(document.getElementById('backtestMaxAiCalls')?.value || 2000);
+        const mode = document.getElementById('backtestMode')?.value || 'candidate_ai';
+
+        if (!startDate || !endDate) {
+            alert('请选择回测开始和结束日期');
+            return;
+        }
+        if (startDate > endDate) {
+            alert('开始日期不能晚于结束日期');
+            return;
+        }
+        if (!Number.isFinite(initialCapital) || initialCapital <= 0) {
+            alert('初始资金必须大于 0');
+            return;
+        }
+        if (!Number.isFinite(maxAiCalls) || maxAiCalls <= 0) {
+            alert('最大AI调用数必须大于 0');
+            return;
+        }
+
+        const statusEl = document.getElementById('backtestStatus');
+        if (statusEl) {
+            statusEl.textContent = '正在创建回测任务并提交到后台，请稍候...';
+        }
+
+        this.stopBacktestPolling();
+        this.setBacktestRunning(true);
+
+        try {
+            const response = await fetch('/api/backtest/jobs', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model_id: this.currentModelId,
+                    start_date: startDate,
+                    end_date: endDate,
+                    initial_capital: initialCapital,
+                    decision_interval_seconds: decisionInterval,
+                    risk_interval_seconds: riskInterval,
+                    max_ai_calls: maxAiCalls,
+                    mode
+                })
+            });
+            const job = await this.parseJsonResponse(response);
+            if (!response.ok) {
+                throw new Error(job.error || '回测失败');
+            }
+
+            this.currentBacktestJobId = job.id;
+            this.clearBacktestResults({ keepStatus: true });
+            this.loadBacktestJobs();
+            if (statusEl) {
+                statusEl.textContent = job.message || '回测任务已提交，正在后台执行...';
+            }
+            this.startBacktestPolling(job.id);
+        } catch (error) {
+            console.error('Backtest job creation failed:', error);
+            if (statusEl) {
+                statusEl.textContent = `回测失败：${error.message}`;
+            }
+            alert(error.message || '回测失败');
+            this.setBacktestRunning(false);
+        }
+    }
+
+    async pollBacktestJob(jobId) {
+        if (!jobId) return;
+        try {
+            const response = await fetch(`/api/backtest/jobs/${jobId}`, {
+                credentials: 'include'
+            });
+            if (!response.ok) {
+                throw new Error('无法获取回测任务状态');
+            }
+            const job = await this.parseJsonResponse(response);
+            const statusEl = document.getElementById('backtestStatus');
+            if (statusEl) {
+                statusEl.textContent = `${job.message || '回测进行中'} (${Math.round(Number(job.progress || 0))}%)`;
+            }
+
+            if (job.status === 'completed') {
+                this.stopBacktestPolling();
+                this.setBacktestRunning(false);
+                this.currentBacktestJobId = job.id;
+                if (job.result) {
+                    this.backtestResult = job.result;
+                    this.renderBacktestResult(job.result);
+                    this.saveBacktestHistoryEntry(job.result);
+                }
+                this.loadBacktestJobs();
+                return;
+            }
+
+            if (job.status === 'failed') {
+                this.stopBacktestPolling();
+                this.setBacktestRunning(false);
+                if (statusEl) {
+                    statusEl.textContent = `回测失败：${job.error || job.message || '未知错误'}`;
+                }
+                this.loadBacktestJobs();
+                return;
+            }
+
+            this.setBacktestRunning(true);
+            this.loadBacktestJobs();
+        } catch (error) {
+            console.error('Failed to poll backtest job:', error);
+        }
+    }
+
+    saveBacktestHistoryEntry(result) {
+        const metrics = result.metrics || {};
+        const settings = result.settings || {};
+        const entry = {
+            created_at: new Date().toISOString(),
+            start_date: result.start_date,
+            end_date: result.end_date,
+            total_return: Number(metrics.total_return || 0),
+            total_net_pnl: Number(metrics.total_net_pnl || 0),
+            win_rate: Number(metrics.win_rate || 0),
+            total_fees: Number(metrics.total_fees || 0),
+            decision_interval_seconds: Number(settings.effective_decision_interval_seconds || 0),
+            risk_interval_seconds: Number(settings.effective_risk_interval_seconds || 0),
+            entry_count: Number(metrics.entry_count || 0),
+            max_drawdown: Number(metrics.max_drawdown || 0),
+        };
+
+        this.backtestHistory = [entry, ...(this.backtestHistory || [])]
+            .slice(0, 10);
+        this.writeBacktestHistory(this.backtestHistory);
+    }
+
+    renderBacktestHistory() {
+        const tbody = document.getElementById('backtestHistoryBody');
+        if (!tbody) return;
+
+        const history = this.backtestHistory || [];
+        if (!history.length) {
+            tbody.innerHTML = '<tr><td colspan="7" class="empty-state">暂无对比记录</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = history.map((item) => {
+            const returnClass = item.total_return > 0 ? 'text-success' : item.total_return < 0 ? 'text-danger' : '';
+            const pnlClass = item.total_net_pnl > 0 ? 'text-success' : item.total_net_pnl < 0 ? 'text-danger' : '';
+            return `
+                <tr>
+                    <td>${new Date(item.created_at).toLocaleString('zh-CN')}</td>
+                    <td>${item.start_date} ~ ${item.end_date}</td>
+                    <td class="${returnClass}">${this.formatPercent(item.total_return)}</td>
+                    <td class="${pnlClass}">${this.formatCurrency(item.total_net_pnl)}</td>
+                    <td>${this.formatPercent(item.win_rate)}</td>
+                    <td>${this.formatCurrency(item.total_fees)}</td>
+                    <td>${this.formatInteger(item.decision_interval_seconds)}秒</td>
+                </tr>
+            `;
+        }).join('');
+    }
+
+    exportBacktest(format) {
+        if (!this.backtestResult) {
+            alert('请先运行一次回测再导出');
+            return;
+        }
+
+        const modelName = (this.currentModel?.name || `model_${this.currentModelId || 'unknown'}`)
+            .replace(/[^\w\u4e00-\u9fa5-]+/g, '_');
+        const suffix = `${this.backtestResult.start_date}_${this.backtestResult.end_date}`;
+
+        if (format === 'json') {
+            const content = JSON.stringify(this.backtestResult, null, 2);
+            this.downloadTextFile(`${modelName}_backtest_${suffix}.json`, content, 'application/json;charset=utf-8');
+            return;
+        }
+
+        const rows = [];
+        rows.push(['section', 'timestamp', 'coin', 'signal', 'price', 'quantity', 'pnl', 'fee']);
+        (this.backtestResult.trades || []).forEach((trade) => {
+            rows.push([
+                'trades',
+                trade.timestamp || '',
+                trade.coin || '',
+                trade.signal || '',
+                trade.price ?? '',
+                trade.quantity ?? '',
+                trade.pnl ?? '',
+                trade.fee ?? ''
+            ]);
+        });
+
+        rows.push([]);
+        rows.push(['metric', 'value']);
+        const metrics = this.backtestResult.metrics || {};
+        Object.entries(metrics).forEach(([key, value]) => {
+            if (Array.isArray(value) || (value && typeof value === 'object')) return;
+            rows.push([key, value]);
+        });
+
+        rows.push([]);
+        rows.push(['coin', 'trades', 'win_rate', 'net_pnl', 'fees']);
+        (metrics.coin_stats || []).forEach((item) => {
+            rows.push([item.coin, item.trades, item.win_rate, item.net_pnl, item.fees]);
+        });
+
+        const csv = rows
+            .map((row) => row.map((value) => {
+                const stringValue = String(value ?? '');
+                return /[",\n]/.test(stringValue) ? `"${stringValue.replace(/"/g, '""')}"` : stringValue;
+            }).join(','))
+            .join('\n');
+        this.downloadTextFile(`${modelName}_backtest_${suffix}.csv`, csv, 'text/csv;charset=utf-8');
+    }
+
+    downloadTextFile(filename, content, mimeType) {
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        URL.revokeObjectURL(url);
+    }
+
     switchTab(tabName) {
         document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
         document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
@@ -1122,9 +1920,10 @@ class TradingApp {
         }
         await Promise.all([
             this.loadMarketPrices({ useCache: false }),
-            this.loadPortfolioSnapshot({ skipCacheWrite: false }),
             this.loadModelData({ silentIfBusy: false }),
-            this.loadKlineData()
+            this.loadKlineData(),
+            this.loadLatestBacktestJob(),
+            this.loadBacktestJobs()
         ]);
     }
 
@@ -1132,7 +1931,11 @@ class TradingApp {
         const refreshWhenVisible = () => {
             if (document.visibilityState === 'visible') {
                 this.loadMarketPrices({ useCache: true });
-                this.loadPortfolioSnapshot({ skipCacheWrite: false });
+                if (this.currentModelId) {
+                    this.loadModelData({ silentIfBusy: true });
+                    this.loadLatestBacktestJob();
+                    this.loadBacktestJobs();
+                }
                 this.loadKlineData();
             }
         };
@@ -1190,6 +1993,13 @@ class TradingApp {
             this.klineChart.dispose();
             this.klineChart = echarts.init(document.getElementById('klineChart'));
             this.loadKlineData();
+        }
+        if (this.backtestChart) {
+            this.backtestChart.dispose();
+            this.backtestChart = echarts.init(document.getElementById('backtestChart'));
+            if (this.backtestResult) {
+                this.renderBacktestChart(this.backtestResult.daily_values || []);
+            }
         }
     }
 

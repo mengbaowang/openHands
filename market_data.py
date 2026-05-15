@@ -162,6 +162,49 @@ class MarketDataFetcher:
         except Exception:
             return None
 
+    def _get_candles_page_from_okx(self, coin: str, timeframe: str, limit: int,
+                                   after: int = None, before: int = None) -> Optional[List[Dict]]:
+        try:
+            inst_id = self.okx_symbols.get(coin)
+            tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
+            if not inst_id or not tf_config:
+                return None
+
+            params = {
+                'instId': inst_id,
+                'bar': tf_config['okx'],
+                'limit': min(limit, 300),
+            }
+            if after is not None:
+                params['after'] = int(after)
+            if before is not None:
+                params['before'] = int(before)
+
+            response = requests.get(
+                f"{self.okx_base_url}/market/history-candles",
+                params=params,
+                timeout=12
+            )
+            response.raise_for_status()
+            data = response.json()
+            if data.get('code') != '0':
+                return None
+
+            return [
+                {
+                    'timestamp': int(c[0]),
+                    'open': float(c[1]),
+                    'high': float(c[2]),
+                    'low': float(c[3]),
+                    'close': float(c[4]),
+                    'price': float(c[4]),
+                    'volume': float(c[5]),
+                }
+                for c in data.get('data', [])
+            ]
+        except Exception:
+            return None
+
     def get_market_data(self, coin: str) -> Dict:
         try:
             inst_id = self.okx_symbols.get(coin)
@@ -221,6 +264,61 @@ class MarketDataFetcher:
         if cache_key in self._cache and time.time() - self._cache_time[cache_key] < 2592000:
             return self._cache[cache_key]
         return []
+
+    def get_historical_candles_range(self, coin: str, timeframe: str,
+                                     start_ts_ms: int, end_ts_ms: int,
+                                     page_limit: int = 300) -> List[Dict]:
+        tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
+        if not tf_config:
+            raise ValueError(f'Unsupported timeframe: {timeframe}')
+        if start_ts_ms > end_ts_ms:
+            return []
+
+        cache_key = f'candles_range_{coin}_{timeframe}_{int(start_ts_ms)}_{int(end_ts_ms)}'
+        if cache_key in self._cache and time.time() - self._cache_time[cache_key] < 21600:
+            return self._cache[cache_key]
+
+        pages = []
+        seen_timestamps = set()
+        cursor_after = int(end_ts_ms) + 1
+        min_start = int(start_ts_ms)
+
+        while True:
+            page = self._get_candles_page_from_okx(
+                coin,
+                timeframe,
+                limit=page_limit,
+                after=cursor_after
+            )
+            if not page:
+                break
+
+            added = 0
+            oldest_ts = None
+            for candle in page:
+                ts = int(candle['timestamp'])
+                oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
+                if ts in seen_timestamps:
+                    continue
+                seen_timestamps.add(ts)
+                if min_start <= ts <= end_ts_ms:
+                    pages.append(candle)
+                    added += 1
+
+            if oldest_ts is None or oldest_ts <= min_start:
+                break
+            if len(page) < page_limit:
+                break
+
+            cursor_after = oldest_ts
+            if added == 0 and oldest_ts > min_start:
+                # Prevent endless pagination if the server keeps repeating the same page.
+                break
+
+        pages.sort(key=lambda item: item['timestamp'])
+        self._cache[cache_key] = pages
+        self._cache_time[cache_key] = time.time()
+        return pages
 
     def calculate_technical_indicators(self, coin: str) -> Dict:
         candles = self.get_historical_candles(coin, timeframe='1h', limit=self.TIMEFRAME_CONFIG['1h']['points'])

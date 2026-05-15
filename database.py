@@ -230,6 +230,71 @@ class Database:
                 FOREIGN KEY (model_id) REFERENCES models(id)
             )
         ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS backtest_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                model_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                mode TEXT NOT NULL DEFAULT 'candidate_ai',
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                initial_capital REAL NOT NULL,
+                decision_interval_seconds INTEGER,
+                risk_interval_seconds INTEGER,
+                max_ai_calls INTEGER DEFAULT 2000,
+                progress REAL DEFAULT 0,
+                current_step INTEGER DEFAULT 0,
+                total_steps INTEGER DEFAULT 0,
+                message TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                result_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (model_id) REFERENCES models(id)
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS backtest_decision_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                decision_json TEXT NOT NULL,
+                raw_response TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                hit_count INTEGER DEFAULT 0,
+                FOREIGN KEY (model_id) REFERENCES models(id),
+                UNIQUE(model_id, mode, fingerprint)
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS backtest_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                model_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                initial_capital REAL NOT NULL,
+                final_value REAL NOT NULL,
+                total_return REAL NOT NULL,
+                summary_json TEXT,
+                metrics_json TEXT,
+                result_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (job_id) REFERENCES backtest_jobs(id),
+                FOREIGN KEY (user_id) REFERENCES users(id),
+                FOREIGN KEY (model_id) REFERENCES models(id)
+            )
+        ''')
         
         conn.commit()
         conn.close()
@@ -323,7 +388,7 @@ class Database:
                 peak_price, peak_profit_pct, last_profit_pct, opened_at, setup_class,
                 entry_confidence, management_stage, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(model_id, coin, side) DO UPDATE SET
                 quantity = excluded.quantity,
                 avg_price = excluded.avg_price,
@@ -732,6 +797,182 @@ class Database:
         rows = cursor.fetchall()
         conn.close()
         return [dict(row) for row in rows]
+
+    # ============ Backtest Jobs ============
+
+    def create_backtest_job(self, user_id: int, model_id: int, mode: str, start_date: str, end_date: str,
+                            initial_capital: float, decision_interval_seconds: int = None,
+                            risk_interval_seconds: int = None, max_ai_calls: int = 2000,
+                            message: str = '已创建回测任务') -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO backtest_jobs (
+                user_id, model_id, status, mode, start_date, end_date, initial_capital,
+                decision_interval_seconds, risk_interval_seconds, max_ai_calls, message
+            )
+            VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            user_id, model_id, mode, start_date, end_date, initial_capital,
+            decision_interval_seconds, risk_interval_seconds, max_ai_calls, message
+        ))
+        job_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return job_id
+
+    def update_backtest_job(self, job_id: int, **fields):
+        if not fields:
+            return
+        allowed = {
+            'status', 'mode', 'progress', 'current_step', 'total_steps', 'message',
+            'error', 'result_json', 'completed_at'
+        }
+        updates = []
+        values = []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            updates.append(f"{key} = ?")
+            values.append(value)
+        if not updates:
+            return
+        updates.append('updated_at = CURRENT_TIMESTAMP')
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"UPDATE backtest_jobs SET {', '.join(updates)} WHERE id = ?",
+            (*values, job_id)
+        )
+        conn.commit()
+        conn.close()
+
+    def get_backtest_job(self, job_id: int) -> Optional[Dict]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM backtest_jobs WHERE id = ?', (job_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_latest_backtest_job(self, user_id: int, model_id: int) -> Optional[Dict]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM backtest_jobs
+            WHERE user_id = ? AND model_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+        ''', (user_id, model_id))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_backtest_jobs(self, user_id: int, model_id: int = None, limit: int = 20) -> List[Dict]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if model_id is not None:
+            cursor.execute('''
+                SELECT * FROM backtest_jobs
+                WHERE user_id = ? AND model_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            ''', (user_id, model_id, limit))
+        else:
+            cursor.execute('''
+                SELECT * FROM backtest_jobs
+                WHERE user_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            ''', (user_id, limit))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def get_backtest_decision_cache(self, model_id: int, mode: str, fingerprint: str) -> Optional[Dict]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM backtest_decision_cache
+            WHERE model_id = ? AND mode = ? AND fingerprint = ?
+            LIMIT 1
+        ''', (model_id, mode, fingerprint))
+        row = cursor.fetchone()
+        if row:
+            cursor.execute('''
+                UPDATE backtest_decision_cache
+                SET hit_count = hit_count + 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (row['id'],))
+            conn.commit()
+        conn.close()
+        return dict(row) if row else None
+
+    def upsert_backtest_decision_cache(self, model_id: int, mode: str, fingerprint: str,
+                                       decision_json: str, raw_response: str = ''):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO backtest_decision_cache (model_id, mode, fingerprint, decision_json, raw_response)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(model_id, mode, fingerprint) DO UPDATE SET
+                decision_json = excluded.decision_json,
+                raw_response = excluded.raw_response,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (model_id, mode, fingerprint, decision_json, raw_response))
+        conn.commit()
+        conn.close()
+
+    def add_backtest_result(self, job_id: int, user_id: int, model_id: int, mode: str,
+                            start_date: str, end_date: str, initial_capital: float,
+                            final_value: float, total_return: float,
+                            summary_json: str = None, metrics_json: str = None,
+                            result_json: str = None) -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO backtest_results (
+                job_id, user_id, model_id, mode, start_date, end_date, initial_capital,
+                final_value, total_return, summary_json, metrics_json, result_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            job_id, user_id, model_id, mode, start_date, end_date, initial_capital,
+            final_value, total_return, summary_json, metrics_json, result_json
+        ))
+        result_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return result_id
+
+    def get_backtest_results(self, user_id: int, model_id: int = None, limit: int = 20) -> List[Dict]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if model_id is not None:
+            cursor.execute('''
+                SELECT * FROM backtest_results
+                WHERE user_id = ? AND model_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            ''', (user_id, model_id, limit))
+        else:
+            cursor.execute('''
+                SELECT * FROM backtest_results
+                WHERE user_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            ''', (user_id, limit))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def get_backtest_result_by_id(self, result_id: int) -> Optional[Dict]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM backtest_results WHERE id = ?', (result_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
 
 
     def get_portfolio(self, model_id: int, current_prices: Dict = None) -> Dict:

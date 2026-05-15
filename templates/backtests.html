@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
+    <title>AI交易器 - 回测中心</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico?v={{ app_version }}">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <link rel="stylesheet" href="/static/style.css?v={{ app_version }}">
+</head>
+<body>
+    <div class="app-container">
+        <header class="app-header">
+            <div class="header-content">
+                <div class="header-left">
+                    <h1 class="app-title">回测中心</h1>
+                    <div class="header-status">
+                        <span class="status-dot active"></span>
+                        <span class="status-text">历史复盘与实验</span>
+                    </div>
+                </div>
+                <div class="header-right">
+                    <a href="/dashboard" class="btn-secondary" title="返回控制台">
+                        <i class="bi bi-grid-1x2-fill"></i>
+                        控制台
+                    </a>
+                    <a href="/" class="btn-icon" title="返回主页">
+                        <i class="bi bi-house-fill"></i>
+                    </a>
+                    <span class="user-info" id="userInfo">加载中...</span>
+                    <button class="btn-icon" id="themeToggle" title="切换主题">
+                        <i class="bi bi-moon-fill"></i>
+                    </button>
+                    <button class="btn-secondary" id="logoutBtn">
+                        <i class="bi bi-box-arrow-right"></i>
+                        登出
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <div class="app-body">
+            <aside class="app-sidebar">
+                <div class="sidebar-section">
+                    <div class="section-header">
+                        <span>交易模型</span>
+                    </div>
+                    <div id="modelList" class="model-list"></div>
+                </div>
+                <div class="sidebar-section">
+                    <div class="section-header">
+                        <span>回测结果</span>
+                    </div>
+                    <div id="backtestResultList" class="model-list"></div>
+                </div>
+            </aside>
+
+            <main class="app-main">
+                <div class="content-card">
+                    <div class="card-header">
+                        <div>
+                            <h3 class="card-title">新建回测</h3>
+                            <p class="card-subtitle">在独立页面里运行回测、查看后台任务和浏览历史结果。</p>
+                        </div>
+                        <div class="backtest-actions">
+                            <button class="btn-secondary" id="backtestResetBtn">
+                                <i class="bi bi-arrow-counterclockwise"></i>
+                                重置
+                            </button>
+                            <button class="btn-primary" id="runBacktestBtn">
+                                <i class="bi bi-play-fill"></i>
+                                运行回测
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="backtest-form-grid">
+                            <div class="form-group">
+                                <label for="backtestStartDate">开始日期</label>
+                                <input type="date" id="backtestStartDate" class="form-input">
+                            </div>
+                            <div class="form-group">
+                                <label for="backtestEndDate">结束日期</label>
+                                <input type="date" id="backtestEndDate" class="form-input">
+                            </div>
+                            <div class="form-group">
+                                <label for="backtestInitialCapital">初始资金</label>
+                                <input type="number" id="backtestInitialCapital" class="form-input" value="10000" min="0" step="100">
+                            </div>
+                            <div class="form-group">
+                                <label for="backtestDecisionInterval">AI决策周期</label>
+                                <select id="backtestDecisionInterval" class="form-input">
+                                    <option value="300">5分钟</option>
+                                    <option value="900">15分钟</option>
+                                    <option value="1800">30分钟</option>
+                                    <option value="3600" selected>1小时</option>
+                                    <option value="14400">4小时</option>
+                                    <option value="86400">1天</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="backtestRiskInterval">风控检查周期</label>
+                                <select id="backtestRiskInterval" class="form-input">
+                                    <option value="300" selected>5分钟</option>
+                                    <option value="900">15分钟</option>
+                                    <option value="1800">30分钟</option>
+                                    <option value="3600">1小时</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="backtestMaxAiCalls">最大AI调用数</label>
+                                <input type="number" id="backtestMaxAiCalls" class="form-input" value="2000" min="1" step="100">
+                            </div>
+                            <div class="form-group">
+                                <label for="backtestMode">回测模式</label>
+                                <select id="backtestMode" class="form-input">
+                                    <option value="candidate_ai" selected>候选信号AI回放</option>
+                                    <option value="fast_rule">纯规则快速回测</option>
+                                    <option value="full_ai">完整AI回放</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="backtest-presets">
+                            <span class="backtest-presets-label">快捷区间</span>
+                            <button class="backtest-preset-btn" data-days="30">近30天</button>
+                            <button class="backtest-preset-btn active" data-days="90">近90天</button>
+                            <button class="backtest-preset-btn" data-days="180">近180天</button>
+                            <button class="backtest-preset-btn" data-days="365">近365天</button>
+                        </div>
+
+                        <div class="backtest-status" id="backtestStatus">选择模型后即可运行回测。默认使用近90天区间。</div>
+                    </div>
+                </div>
+
+                <div class="content-card">
+                    <div class="card-header">
+                        <div>
+                            <h3 class="card-title">后台任务</h3>
+                            <p class="card-subtitle">查看进行中的回测任务，刷新页面后也能继续追踪。</p>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-container">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>创建时间</th>
+                                        <th>模式</th>
+                                        <th>区间</th>
+                                        <th>状态</th>
+                                        <th>进度</th>
+                                        <th>说明</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="backtestJobsBody">
+                                    <tr><td colspan="6" class="empty-state">暂无任务</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="backtest-empty" id="backtestEmptyState">
+                    <div class="backtest-empty-title">请选择一条回测结果</div>
+                    <div class="backtest-empty-text">左侧会列出当前模型的历史回测结果，点击后可查看该次回测的资金曲线、指标、币种表现和成交详情。</div>
+                </div>
+
+                <div class="backtest-results hidden" id="backtestResults">
+                    <div class="backtest-summary-grid" id="backtestSummaryGrid">
+                        <div class="backtest-metric-card">
+                            <div class="backtest-metric-label">总收益率</div>
+                            <div class="backtest-metric-value" data-metric="total_return">--</div>
+                        </div>
+                        <div class="backtest-metric-card">
+                            <div class="backtest-metric-label">净利润</div>
+                            <div class="backtest-metric-value" data-metric="total_net_pnl">--</div>
+                        </div>
+                        <div class="backtest-metric-card">
+                            <div class="backtest-metric-label">胜率</div>
+                            <div class="backtest-metric-value" data-metric="win_rate">--</div>
+                        </div>
+                        <div class="backtest-metric-card">
+                            <div class="backtest-metric-label">总手续费</div>
+                            <div class="backtest-metric-value" data-metric="total_fees">--</div>
+                        </div>
+                        <div class="backtest-metric-card">
+                            <div class="backtest-metric-label">开仓次数</div>
+                            <div class="backtest-metric-value" data-metric="entry_count">--</div>
+                        </div>
+                        <div class="backtest-metric-card">
+                            <div class="backtest-metric-label">最大回撤</div>
+                            <div class="backtest-metric-value" data-metric="max_drawdown">--</div>
+                        </div>
+                    </div>
+
+                    <div class="backtest-chart-panel">
+                        <div class="section-header-row">
+                            <h4>资金曲线</h4>
+                            <div class="backtest-inline-actions">
+                                <span id="backtestRunMeta" class="muted-meta"></span>
+                                <button class="btn-secondary btn-inline" id="exportBacktestJsonBtn">
+                                    <i class="bi bi-filetype-json"></i>
+                                    导出JSON
+                                </button>
+                                <button class="btn-secondary btn-inline" id="exportBacktestCsvBtn">
+                                    <i class="bi bi-file-earmark-spreadsheet"></i>
+                                    导出CSV
+                                </button>
+                            </div>
+                        </div>
+                        <div id="backtestChart" style="width: 100%; height: 320px;"></div>
+                    </div>
+
+                    <div class="backtest-table-grid">
+                        <div class="backtest-table-panel">
+                            <div class="section-header-row">
+                                <h4>按币种统计</h4>
+                            </div>
+                            <div class="table-container">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th>币种</th>
+                                            <th>交易数</th>
+                                            <th>胜率</th>
+                                            <th>净盈亏</th>
+                                            <th>手续费</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="backtestCoinStatsBody">
+                                        <tr><td colspan="5" class="empty-state">暂无数据</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        <div class="backtest-table-panel">
+                            <div class="section-header-row">
+                                <h4>最近回测成交</h4>
+                            </div>
+                            <div class="table-container">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th>时间</th>
+                                            <th>币种</th>
+                                            <th>动作</th>
+                                            <th>价格</th>
+                                            <th>净盈亏</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="backtestTradesBody">
+                                        <tr><td colspan="5" class="empty-state">暂无数据</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <script src="/static/backtests.js?v={{ app_version }}"></script>
+</body>
+</html>

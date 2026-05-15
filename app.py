@@ -1,6 +1,7 @@
 """Flask Web 应用入口，负责认证、模型管理、仪表盘和交易 API。"""
 from flask import Flask, render_template, request, jsonify, session
 from flask_cors import CORS
+import json
 import time
 import threading
 from datetime import datetime
@@ -116,6 +117,8 @@ backtester = None  # 延迟初始化
 trading_engines = {}
 auto_trading = config.AUTO_TRADING
 _request_log_timestamps = {}
+backtest_job_threads = {}
+backtest_job_lock = threading.Lock()
 
 # ============ Helper Functions ============
 
@@ -184,6 +187,132 @@ def _check_model_ownership(model_id: int, user_id: int) -> bool:
         return False
     return model.get('user_id') == user_id
 
+
+def _serialize_backtest_job(job: Dict) -> Dict:
+    if not job:
+        return {}
+    payload = dict(job)
+    result_json = payload.get('result_json')
+    if result_json:
+        try:
+            payload['result'] = json.loads(result_json)
+        except Exception:
+            payload['result'] = None
+    else:
+        payload['result'] = None
+    payload.pop('result_json', None)
+    return payload
+
+
+def _serialize_backtest_result(row: Dict) -> Dict:
+    if not row:
+        return {}
+    payload = dict(row)
+    for key in ('summary_json', 'metrics_json', 'result_json'):
+        value = payload.get(key)
+        parsed_key = key.replace('_json', '')
+        if value:
+            try:
+                payload[parsed_key] = json.loads(value)
+            except Exception:
+                payload[parsed_key] = None
+        else:
+            payload[parsed_key] = None
+        payload.pop(key, None)
+    return payload
+
+
+def _create_backtester_for_model_config(model_config: Dict) -> Backtester:
+    ai_trader = AITrader(
+        api_key=model_config['api_key'],
+        api_url=model_config['api_url'],
+        model_name=model_config['model_name'],
+        system_prompt=model_config.get('system_prompt')
+    )
+    return Backtester(db, market_fetcher, ai_trader)
+
+
+def _run_backtest_job(job_id: int, model_config: Dict, start_date: str, end_date: str,
+                      initial_capital: float, decision_interval_seconds: int,
+                      risk_interval_seconds: int, max_ai_calls: int, mode: str):
+    job_row = db.get_backtest_job(job_id) or {}
+    user_id = int(job_row.get('user_id') or 0)
+    model_id = int(job_row.get('model_id') or model_config.get('model_id') or 0)
+
+    def progress_callback(progress: float, current_step: int, total_steps: int, message: str):
+        db.update_backtest_job(
+            job_id,
+            status='running',
+            progress=max(0.0, min(100.0, float(progress))),
+            current_step=int(current_step),
+            total_steps=int(total_steps),
+            message=message or ''
+        )
+
+    db.update_backtest_job(job_id, status='running', progress=0, message='开始准备历史数据')
+    try:
+        local_backtester = _create_backtester_for_model_config(model_config)
+        result = local_backtester.run_backtest(
+            model_config,
+            start_date,
+            end_date,
+            initial_capital,
+            decision_interval_seconds=decision_interval_seconds,
+            risk_interval_seconds=risk_interval_seconds,
+            max_ai_calls=max_ai_calls,
+            mode=mode,
+            progress_callback=progress_callback,
+        )
+        result_json = json.dumps(result, ensure_ascii=False)
+        db.update_backtest_job(
+            job_id,
+            status='completed',
+            progress=100,
+            current_step=result.get('summary', {}).get('decision_cycles', 0),
+            total_steps=result.get('summary', {}).get('decision_cycles', 0),
+            message='回测完成',
+            result_json=result_json,
+            error='',
+            completed_at=get_current_utc_time_str()
+        )
+        if user_id and model_id:
+            db.add_backtest_result(
+                job_id=job_id,
+                user_id=user_id,
+                model_id=model_id,
+                mode=mode,
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=initial_capital,
+                final_value=float(result.get('final_value', 0) or 0),
+                total_return=float(result.get('total_return', 0) or 0),
+                summary_json=json.dumps(result.get('summary', {}), ensure_ascii=False),
+                metrics_json=json.dumps(result.get('metrics', {}), ensure_ascii=False),
+                result_json=result_json,
+            )
+    except ValueError as exc:
+        db.update_backtest_job(
+            job_id,
+            status='failed',
+            message='回测失败',
+            error=str(exc),
+            completed_at=get_current_utc_time_str()
+        )
+    except Exception as exc:
+        import traceback
+        print(f'[ERROR] Backtest job {job_id} failed: {exc}')
+        print(traceback.format_exc())
+        db.update_backtest_job(
+            job_id,
+            status='failed',
+            message='回测失败',
+            error=str(exc),
+            completed_at=get_current_utc_time_str()
+        )
+    finally:
+        with backtest_job_lock:
+            backtest_job_threads.pop(job_id, None)
+
 @app.route('/image/<path:filename>')
 def serve_image(filename):
     """提供image目录下的静态文件"""
@@ -205,6 +334,13 @@ def login_page():
 def dashboard():
     """仪表板（需要登录）"""
     return render_template('dashboard.html')
+
+
+@app.route('/backtests')
+@login_required
+def backtests_page():
+    """回测中心页面"""
+    return render_template('backtests.html')
 
 # ============ Authentication APIs ============
 
@@ -511,37 +647,132 @@ def get_risk_metrics(model_id):
     risk_metrics = risk_manager.get_risk_metrics(model_id, portfolio)
     return jsonify(risk_metrics)
 
-@app.route('/api/backtest', methods=['POST'])
-def run_backtest():
-    """运行回测"""
-    global backtester
+@app.route('/api/backtest/jobs', methods=['POST'])
+@login_required
+def create_backtest_job():
+    """创建后台回测任务"""
+    user_id = get_current_user_id()
+    data = request.json or {}
+    model_id = data.get('model_id')
+    if not model_id:
+        return jsonify({'error': '缺少 model_id'}), 400
+    if not _check_model_ownership(model_id, user_id):
+        return jsonify({'error': '无权访问此模型'}), 403
 
-    data = request.json
+    model = db.get_model(model_id)
+    mode = str(data.get('mode') or 'candidate_ai')
+    if mode not in {'full_ai', 'candidate_ai', 'fast_rule'}:
+        return jsonify({'error': '不支持的回测模式'}), 400
+
     model_config = {
-        'api_key': data.get('api_key'),
-        'api_url': data.get('api_url'),
-        'model_name': data.get('model_name')
+        'model_id': model_id,
+        'api_key': data.get('api_key') or (model.get('api_key') if model else None),
+        'api_url': data.get('api_url') or (model.get('api_url') if model else None),
+        'model_name': data.get('model_name') or (model.get('model_name') if model else None),
+        'system_prompt': data.get('system_prompt') or (model.get('system_prompt') if model else None),
     }
+    if mode in {'full_ai', 'candidate_ai'} and (
+        not model_config['api_key'] or not model_config['api_url'] or not model_config['model_name']
+    ):
+        return jsonify({'error': 'AI回测模式缺少模型配置'}), 400
+
     start_date = data.get('start_date')
     end_date = data.get('end_date')
-    initial_capital = data.get('initial_capital', 10000)
+    if not start_date or not end_date:
+        return jsonify({'error': '缺少回测时间范围'}), 400
+    initial_capital = float(data.get('initial_capital', model.get('initial_capital', 10000) if model else 10000))
+    decision_interval_seconds = data.get('decision_interval_seconds')
+    risk_interval_seconds = data.get('risk_interval_seconds')
+    max_ai_calls = int(data.get('max_ai_calls', 2000))
 
-    # 延迟初始化backtester
-    if backtester is None:
-        ai_trader = AITrader(
-            api_key=model_config['api_key'],
-            api_url=model_config['api_url'],
-            model_name=model_config['model_name']
-        )
-        backtester = Backtester(db, market_fetcher, ai_trader)
+    job_id = db.create_backtest_job(
+        user_id=user_id,
+        model_id=model_id,
+        mode=mode,
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=initial_capital,
+        decision_interval_seconds=decision_interval_seconds,
+        risk_interval_seconds=risk_interval_seconds,
+        max_ai_calls=max_ai_calls,
+        message='任务已创建，等待后台执行'
+    )
 
-    try:
-        result = backtester.run_backtest(
-            model_config, start_date, end_date, initial_capital
-        )
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+    worker = threading.Thread(
+        target=_run_backtest_job,
+        args=(
+            job_id,
+            model_config,
+            start_date,
+            end_date,
+            initial_capital,
+            decision_interval_seconds,
+            risk_interval_seconds,
+            max_ai_calls,
+            mode,
+        ),
+        daemon=True
+    )
+    with backtest_job_lock:
+        backtest_job_threads[job_id] = worker
+    worker.start()
+    return jsonify(_serialize_backtest_job(db.get_backtest_job(job_id))), 202
+
+
+@app.route('/api/backtest/jobs/<int:job_id>', methods=['GET'])
+@login_required
+def get_backtest_job(job_id):
+    user_id = get_current_user_id()
+    job = db.get_backtest_job(job_id)
+    if not job:
+        return jsonify({'error': '回测任务不存在'}), 404
+    if job.get('user_id') != user_id:
+        return jsonify({'error': '无权访问此回测任务'}), 403
+    return jsonify(_serialize_backtest_job(job))
+
+
+@app.route('/api/models/<int:model_id>/backtest-jobs/latest', methods=['GET'])
+@login_required
+def get_latest_backtest_job(model_id):
+    user_id = get_current_user_id()
+    if not _check_model_ownership(model_id, user_id):
+        return jsonify({'error': '无权访问此模型'}), 403
+    job = db.get_latest_backtest_job(user_id, model_id)
+    return jsonify(_serialize_backtest_job(job) if job else {})
+
+
+@app.route('/api/models/<int:model_id>/backtest-jobs', methods=['GET'])
+@login_required
+def get_model_backtest_jobs(model_id):
+    user_id = get_current_user_id()
+    if not _check_model_ownership(model_id, user_id):
+        return jsonify({'error': '无权访问此模型'}), 403
+    limit = int(request.args.get('limit', 20))
+    jobs = db.get_backtest_jobs(user_id, model_id=model_id, limit=limit)
+    return jsonify([_serialize_backtest_job(job) for job in jobs])
+
+
+@app.route('/api/models/<int:model_id>/backtest-results', methods=['GET'])
+@login_required
+def get_model_backtest_results(model_id):
+    user_id = get_current_user_id()
+    if not _check_model_ownership(model_id, user_id):
+        return jsonify({'error': '无权访问此模型'}), 403
+    limit = int(request.args.get('limit', 20))
+    results = db.get_backtest_results(user_id, model_id=model_id, limit=limit)
+    return jsonify([_serialize_backtest_result(item) for item in results])
+
+
+@app.route('/api/backtest-results/<int:result_id>', methods=['GET'])
+@login_required
+def get_backtest_result_detail(result_id):
+    user_id = get_current_user_id()
+    row = db.get_backtest_result_by_id(result_id)
+    if not row:
+        return jsonify({'error': '回测结果不存在'}), 404
+    if row.get('user_id') != user_id:
+        return jsonify({'error': '无权访问此回测结果'}), 403
+    return jsonify(_serialize_backtest_result(row))
 
 @app.route('/api/models/<int:model_id>/performance', methods=['GET'])
 @login_required
@@ -1399,4 +1630,10 @@ if __name__ == '__main__':
     
     print(f"Server: http://localhost:{config.PORT}")
 
-    app.run(debug=config.DEBUG, host=config.HOST, port=config.PORT, use_reloader=False)
+    app.run(
+        debug=config.DEBUG,
+        host=config.HOST,
+        port=config.PORT,
+        use_reloader=False,
+        threaded=True
+    )

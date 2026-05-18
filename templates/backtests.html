@@ -80,6 +80,14 @@
                     <div class="card-body">
                         <div class="backtest-form-grid">
                             <div class="form-group">
+                                <label for="strategyCode">回测策略</label>
+                                <select id="strategyCode" class="form-input">
+                                    <option value="ai_replay" selected>AI策略回放</option>
+                                    <option value="event_reversal">事件反转策略</option>
+                                    <option value="event_reversal_futures">合约版反转策略</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
                                 <label for="backtestStartDate">开始日期</label>
                                 <input type="date" id="backtestStartDate" class="form-input">
                             </div>
@@ -122,6 +130,95 @@
                                     <option value="fast_rule">纯规则快速回测</option>
                                     <option value="full_ai">完整AI回放</option>
                                 </select>
+                            </div>
+                        </div>
+
+                        <div class="backtest-form-grid hidden" id="eventStrategyFields">
+                            <div class="form-group">
+                                <label for="eventPair">交易对</label>
+                                <input type="text" id="eventPair" class="form-input" value="BTCUSDT">
+                            </div>
+                            <div class="form-group">
+                                <label for="eventInterval">K线周期</label>
+                                <select id="eventInterval" class="form-input">
+                                    <option value="1m" selected>1分钟</option>
+                                    <option value="5m">5分钟</option>
+                                    <option value="15m">15分钟</option>
+                                    <option value="30m">30分钟</option>
+                                    <option value="1h">1小时</option>
+                                    <option value="4h">4小时</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="eventPayoutRatio">胜利收益倍率</label>
+                                <input type="number" id="eventPayoutRatio" class="form-input" value="0.92" min="0" step="0.01">
+                            </div>
+                            <div class="form-group">
+                                <label for="eventCooldownSignals">第五层失败后冷却信号数</label>
+                                <input type="number" id="eventCooldownSignals" class="form-input" value="3" min="0" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="eventStakeLadder">下注层级</label>
+                                <input type="text" id="eventStakeLadder" class="form-input" value="7,13,30,66,142">
+                            </div>
+                        </div>
+
+                        <div class="backtest-form-grid hidden" id="futuresStrategyFields">
+                            <div class="form-group">
+                                <label for="futuresCoin">合约币种</label>
+                                <input type="text" id="futuresCoin" class="form-input" value="BTC">
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresTimeframe">K线周期</label>
+                                <select id="futuresTimeframe" class="form-input">
+                                    <option value="5m">5分钟</option>
+                                    <option value="15m" selected>15分钟</option>
+                                    <option value="1h">1小时</option>
+                                    <option value="4h">4小时</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresLeverage">杠杆倍数</label>
+                                <input type="number" id="futuresLeverage" class="form-input" value="2" min="1" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresRiskPct">单笔风险占比</label>
+                                <input type="number" id="futuresRiskPct" class="form-input" value="0.005" min="0.0005" step="0.0005">
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresStopLossPct">止损比例</label>
+                                <input type="number" id="futuresStopLossPct" class="form-input" value="0.003" min="0.0005" step="0.0005">
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresTakeProfitPct">止盈比例</label>
+                                <input type="number" id="futuresTakeProfitPct" class="form-input" value="0.006" min="0.0005" step="0.0005">
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresMaxHoldBars">最大持仓K线数</label>
+                                <input type="number" id="futuresMaxHoldBars" class="form-input" value="3" min="1" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresFeeRate">双边手续费率</label>
+                                <input type="number" id="futuresFeeRate" class="form-input" value="0.0005" min="0" step="0.0001">
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresSlippageRate">滑点率</label>
+                                <input type="number" id="futuresSlippageRate" class="form-input" value="0.0002" min="0" step="0.0001">
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresTrendFilterEnabled">强趋势过滤</label>
+                                <select id="futuresTrendFilterEnabled" class="form-input">
+                                    <option value="true" selected>开启</option>
+                                    <option value="false">关闭</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresTrendRsiThreshold">趋势RSI阈值</label>
+                                <input type="number" id="futuresTrendRsiThreshold" class="form-input" value="60" min="50" max="90" step="1">
+                            </div>
+                            <div class="form-group">
+                                <label for="futuresTrendLookback">趋势观察K线数</label>
+                                <input type="number" id="futuresTrendLookback" class="form-input" value="30" min="20" step="1">
                             </div>
                         </div>
 
@@ -259,6 +356,104 @@
                                     </tbody>
                                 </table>
                             </div>
+                        </div>
+                    </div>
+
+                    <div class="backtest-history-panel hidden" id="exitReasonStatsPanel">
+                        <div class="section-header-row">
+                            <h4>出场原因统计</h4>
+                            <span class="muted-meta">帮助判断主要死因是止损、止盈还是时间出场</span>
+                        </div>
+                        <div class="table-container">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>出场原因</th>
+                                        <th>次数</th>
+                                        <th>净盈亏</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="exitReasonStatsBody">
+                                    <tr><td colspan="3" class="empty-state">暂无数据</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                        <div class="ladder-round-summary" id="futuresFilterSummary">
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">候选形态数</span>
+                                <span class="ladder-round-summary-value" id="futuresPatternCandidates">--</span>
+                            </div>
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">趋势过滤跳过</span>
+                                <span class="ladder-round-summary-value" id="futuresTrendFiltered">--</span>
+                            </div>
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">最终执行入场</span>
+                                <span class="ladder-round-summary-value" id="futuresExecutedEntries">--</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="backtest-history-panel hidden" id="executionStatsPanel">
+                        <div class="section-header-row">
+                            <h4>预下单 / 收盘复核模拟统计</h4>
+                            <span class="muted-meta">仅对事件反转策略展示</span>
+                        </div>
+                        <div class="ladder-round-summary" id="executionStatsGrid">
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">候选形态数</span>
+                                <span class="ladder-round-summary-value" id="execPatternCandidates">--</span>
+                            </div>
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">预下单次数</span>
+                                <span class="ladder-round-summary-value" id="execPreorderArmed">--</span>
+                            </div>
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">最终确认入场</span>
+                                <span class="ladder-round-summary-value" id="execFinalConfirmed">--</span>
+                            </div>
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">复核未通过</span>
+                                <span class="ladder-round-summary-value" id="execRecheckRejected">--</span>
+                            </div>
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">冷却拒绝</span>
+                                <span class="ladder-round-summary-value" id="execCooldownRejected">--</span>
+                            </div>
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">余额不足拒绝</span>
+                                <span class="ladder-round-summary-value" id="execBalanceRejected">--</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="backtest-history-panel hidden" id="ladderRoundsPanel">
+                        <div class="section-header-row">
+                            <h4>马丁 / 分层推进过程</h4>
+                            <span class="muted-meta">仅对事件反转策略展示</span>
+                        </div>
+                        <div id="ladderRoundsList" class="ladder-rounds-list">
+                            <div class="empty-state">暂无分层推进数据</div>
+                        </div>
+                    </div>
+
+                    <div class="backtest-history-panel hidden" id="highRiskRoundsPanel">
+                        <div class="section-header-row">
+                            <h4>高风险轮次</h4>
+                            <span class="muted-meta">重点显示打到第4层和第5层的轮次</span>
+                        </div>
+                        <div class="ladder-round-summary" id="highRiskSummaryGrid">
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">打到第4层及以上</span>
+                                <span class="ladder-round-summary-value" id="highRiskCount4">--</span>
+                            </div>
+                            <div class="ladder-round-summary-item">
+                                <span class="ladder-round-summary-label">打到第5层</span>
+                                <span class="ladder-round-summary-value" id="highRiskCount5">--</span>
+                            </div>
+                        </div>
+                        <div id="highRiskRoundsList" class="ladder-rounds-list">
+                            <div class="empty-state">暂无高风险轮次</div>
                         </div>
                     </div>
                 </div>

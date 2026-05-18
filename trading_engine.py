@@ -126,11 +126,24 @@ class TradingEngine:
         market_state = {}
         prices = self.market_fetcher.get_current_prices(self.coins)
         for coin in self.coins:
-            if coin in prices:
-                market_state[coin] = prices[coin].copy()
-                timeframe_indicators = self.market_fetcher.get_multi_timeframe_indicators(coin)
-                market_state[coin]['timeframes'] = timeframe_indicators
-                market_state[coin]['indicators'] = timeframe_indicators.get('1h', {})
+            timeframe_indicators = self.market_fetcher.get_multi_timeframe_indicators(coin)
+            price_payload = prices.get(coin, {}) if isinstance(prices, dict) else {}
+            fallback_price = (
+                (timeframe_indicators.get('5m') or {}).get('current_price') or
+                (timeframe_indicators.get('15m') or {}).get('current_price') or
+                (timeframe_indicators.get('1h') or {}).get('current_price') or
+                0
+            )
+            current_price = float(price_payload.get('price') or fallback_price or 0)
+            if current_price <= 0 and not any(timeframe_indicators.values()):
+                continue
+
+            market_state[coin] = {
+                'price': current_price,
+                'change_24h': float(price_payload.get('change_24h', 0) or 0),
+                'timeframes': timeframe_indicators,
+                'indicators': timeframe_indicators.get('1h', {})
+            }
         return market_state
 
     def _build_account_info(self, portfolio: Dict) -> Dict:

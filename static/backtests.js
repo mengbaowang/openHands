@@ -45,6 +45,7 @@ class BacktestCenterApp {
         document.getElementById('exportBacktestCsvBtn')?.addEventListener('click', () => this.exportBacktest('csv'));
         document.getElementById('themeToggle')?.addEventListener('click', () => this.toggleTheme());
         document.getElementById('logoutBtn')?.addEventListener('click', () => this.logout());
+        document.getElementById('strategyCode')?.addEventListener('change', () => this.updateStrategyFields());
         document.querySelectorAll('.backtest-preset-btn').forEach((btn) => {
             btn.addEventListener('click', () => this.applyBacktestPreset(Number(btn.dataset.days || 90)));
         });
@@ -78,6 +79,8 @@ class BacktestCenterApp {
         document.getElementById('backtestRiskInterval').value = '300';
         document.getElementById('backtestMaxAiCalls').value = '2000';
         document.getElementById('backtestMode').value = 'candidate_ai';
+        document.getElementById('strategyCode').value = 'ai_replay';
+        this.updateStrategyFields();
         if (this.currentModel?.initial_capital !== undefined) {
             document.getElementById('backtestInitialCapital').value = Number(this.currentModel.initial_capital || 10000);
         }
@@ -136,14 +139,25 @@ class BacktestCenterApp {
         }
         container.innerHTML = results.map((item) => `
             <div class="model-item ${this.currentResult && this.currentResult.id === item.id ? 'active' : ''}" data-result-id="${item.id}">
-                <div class="model-name">${item.start_date} ~ ${item.end_date}</div>
+                <div class="model-name">
+                    <span>${item.start_date} ~ ${item.end_date}</span>
+                    <button class="btn-icon backtest-delete-btn" data-delete-result-id="${item.id}" title="删除回测结果">
+                        <i class="bi bi-trash"></i>
+                    </button>
+                </div>
                 <div class="model-info">
-                    <span>${this.renderModeText(item.mode)} · ${this.formatPercent(item.total_return)}</span>
+                    <span>${this.renderStrategyText(item.strategy_code)} · ${this.renderModeText(item.mode)} · ${this.renderIntervalText(item)} · ${this.formatPercent(item.total_return)}</span>
                 </div>
             </div>
         `).join('');
         container.querySelectorAll('[data-result-id]').forEach((item) => {
             item.addEventListener('click', () => this.loadBacktestResultDetail(Number(item.dataset.resultId)));
+        });
+        container.querySelectorAll('[data-delete-result-id]').forEach((button) => {
+            button.addEventListener('click', (event) => {
+                event.stopPropagation();
+                this.deleteBacktestResult(Number(button.dataset.deleteResultId));
+            });
         });
     }
 
@@ -182,10 +196,14 @@ class BacktestCenterApp {
         });
 
         document.getElementById('backtestRunMeta').textContent =
-            `${this.renderModeText(row.mode)} · ${row.start_date} ~ ${row.end_date} · 结束资金 ${this.formatCurrency(result.final_value || 0)}`;
+            `${this.renderStrategyText(row.strategy_code)} · ${this.renderModeText(row.mode)} · ${row.start_date} ~ ${row.end_date} · 结束资金 ${this.formatCurrency(result.final_value || 0)}`;
         this.renderBacktestChart(result.daily_values || []);
         this.renderCoinStats(metrics.coin_stats || []);
         this.renderTrades(result.trades || []);
+        this.renderExitReasonStats(metrics.exit_reason_stats || {}, metrics, row.strategy_code);
+        this.renderLadderRounds(metrics.ladder_rounds || [], row.strategy_code);
+        this.renderExecutionStats(metrics.execution_simulation || {}, row.strategy_code);
+        this.renderHighRiskRounds(metrics.ladder_rounds || [], metrics, row.strategy_code);
     }
 
     async loadBacktestJobs() {
@@ -205,7 +223,7 @@ class BacktestCenterApp {
         tbody.innerHTML = jobs.map((job) => `
             <tr>
                 <td>${new Date(job.created_at).toLocaleString('zh-CN')}</td>
-                <td>${this.renderModeText(job.mode)}</td>
+                <td>${this.renderStrategyText(job.strategy_code)} / ${this.renderModeText(job.mode)}</td>
                 <td>${job.start_date} ~ ${job.end_date}</td>
                 <td>${statusMap[job.status] || job.status}</td>
                 <td>${Math.round(Number(job.progress || 0))}%</td>
@@ -223,11 +241,14 @@ class BacktestCenterApp {
         this.currentBacktestJobId = job.id;
         if (['queued', 'running'].includes(job.status)) {
             document.getElementById('backtestStatus').textContent = `${job.message || '回测进行中'} (${Math.round(Number(job.progress || 0))}%)`;
+            this.setRunning(true);
             this.startBacktestPolling(job.id);
         } else if (job.status === 'completed') {
             document.getElementById('backtestStatus').textContent = job.message || '最近任务已完成';
+            this.setRunning(false);
         } else if (job.status === 'failed') {
             document.getElementById('backtestStatus').textContent = `最近任务失败：${job.error || job.message || '未知错误'}`;
+            this.setRunning(false);
         }
     }
 
@@ -252,14 +273,16 @@ class BacktestCenterApp {
         await this.loadBacktestJobs();
         if (job.status === 'completed') {
             this.stopBacktestPolling();
+            this.setRunning(false);
             await this.loadBacktestResults();
             if (job.result) {
-                this.currentResult = { id: job.id, mode: job.mode, start_date: job.start_date, end_date: job.end_date, result: job.result };
+                this.currentResult = { id: job.id, strategy_code: job.strategy_code, mode: job.mode, start_date: job.start_date, end_date: job.end_date, result: job.result };
                 this.renderBacktestDetail(this.currentResult);
             }
         }
         if (job.status === 'failed') {
             this.stopBacktestPolling();
+            this.setRunning(false);
         }
     }
 
@@ -270,8 +293,10 @@ class BacktestCenterApp {
         }
         if (this.isRunningBacktest) return;
 
+        const strategyCode = document.getElementById('strategyCode').value || 'ai_replay';
         const payload = {
             model_id: this.currentModelId,
+            strategy_code: strategyCode,
             start_date: document.getElementById('backtestStartDate').value,
             end_date: document.getElementById('backtestEndDate').value,
             initial_capital: Number(document.getElementById('backtestInitialCapital').value || 0),
@@ -279,6 +304,29 @@ class BacktestCenterApp {
             risk_interval_seconds: Number(document.getElementById('backtestRiskInterval').value || 300),
             max_ai_calls: Number(document.getElementById('backtestMaxAiCalls').value || 2000),
             mode: document.getElementById('backtestMode').value || 'candidate_ai',
+            strategy_params: strategyCode === 'event_reversal' ? {
+                pair: document.getElementById('eventPair').value || 'BTCUSDT',
+                interval: document.getElementById('eventInterval').value || '1m',
+                payout_ratio: Number(document.getElementById('eventPayoutRatio').value || 0.92),
+                cooldown_signals: Number(document.getElementById('eventCooldownSignals').value || 3),
+                stakes: String(document.getElementById('eventStakeLadder').value || '7,13,30,66,142')
+                    .split(',')
+                    .map((item) => Number(item.trim()))
+                    .filter((item) => Number.isFinite(item) && item > 0),
+            } : strategyCode === 'event_reversal_futures' ? {
+                coin: document.getElementById('futuresCoin').value || 'BTC',
+                timeframe: document.getElementById('futuresTimeframe').value || '15m',
+                leverage: Number(document.getElementById('futuresLeverage').value || 2),
+                risk_pct: Number(document.getElementById('futuresRiskPct').value || 0.005),
+                stop_loss_pct: Number(document.getElementById('futuresStopLossPct').value || 0.003),
+                take_profit_pct: Number(document.getElementById('futuresTakeProfitPct').value || 0.006),
+                max_hold_bars: Number(document.getElementById('futuresMaxHoldBars').value || 3),
+                fee_rate: Number(document.getElementById('futuresFeeRate').value || 0.0005),
+                slippage_rate: Number(document.getElementById('futuresSlippageRate').value || 0.0002),
+                trend_filter_enabled: (document.getElementById('futuresTrendFilterEnabled').value || 'true') === 'true',
+                trend_rsi_threshold: Number(document.getElementById('futuresTrendRsiThreshold').value || 60),
+                trend_lookback: Number(document.getElementById('futuresTrendLookback').value || 30),
+            } : {},
         };
         document.getElementById('backtestStatus').textContent = '正在创建回测任务并提交到后台，请稍候...';
         this.setRunning(true);
@@ -369,6 +417,166 @@ class BacktestCenterApp {
         `).join('');
     }
 
+    renderLadderRounds(rounds, strategyCode) {
+        const panel = document.getElementById('ladderRoundsPanel');
+        const list = document.getElementById('ladderRoundsList');
+        if (!panel || !list) return;
+
+        if (strategyCode !== 'event_reversal' || !Array.isArray(rounds) || !rounds.length) {
+            panel.classList.add('hidden');
+            list.innerHTML = '<div class="empty-state">暂无分层推进数据</div>';
+            return;
+        }
+
+        panel.classList.remove('hidden');
+        list.innerHTML = rounds.map((round) => {
+            const isWin = round.final_status === 'win';
+            return `
+                <div class="ladder-round-card">
+                    <div class="ladder-round-header">
+                        <div class="ladder-round-title">第 ${round.round_id} 轮</div>
+                        <div class="ladder-round-badge ${isWin ? 'win' : 'loss'}">${isWin ? '本轮获胜' : '第五层失败'}</div>
+                    </div>
+                    <div class="ladder-round-summary">
+                        <div class="ladder-round-summary-item">
+                            <span class="ladder-round-summary-label">推进层数</span>
+                            <span class="ladder-round-summary-value">${this.formatInteger(round.levels_used)}</span>
+                        </div>
+                        <div class="ladder-round-summary-item">
+                            <span class="ladder-round-summary-label">总下注</span>
+                            <span class="ladder-round-summary-value">${this.formatCurrency(round.total_stake)}</span>
+                        </div>
+                        <div class="ladder-round-summary-item">
+                            <span class="ladder-round-summary-label">本轮净盈亏</span>
+                            <span class="ladder-round-summary-value ${round.total_pnl > 0 ? 'text-success' : round.total_pnl < 0 ? 'text-danger' : ''}">${this.formatCurrency(round.total_pnl)}</span>
+                        </div>
+                    </div>
+                    <div class="ladder-steps">
+                        ${(round.steps || []).map((step) => `
+                            <div class="ladder-step">
+                                <div class="ladder-step-index">第${step.level}层</div>
+                                <div class="ladder-step-body">
+                                    <div class="ladder-step-main">${step.timestamp} · ${step.direction} · 下注 ${this.formatCurrency(step.stake)}</div>
+                                    <div class="ladder-step-sub">触发形态: ${step.trigger_color === 'bull' ? '三连阳反转做空' : '三连阴反转做多'} · 手续费 ${this.formatCurrency(step.fee, 4)}</div>
+                                </div>
+                                <div class="ladder-step-result ${step.won ? 'text-success' : 'text-danger'}">${step.won ? '胜' : '负'} ${this.formatCurrency(step.pnl)}</div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    renderExitReasonStats(exitReasonStats, metrics, strategyCode) {
+        const panel = document.getElementById('exitReasonStatsPanel');
+        const tbody = document.getElementById('exitReasonStatsBody');
+        if (!panel || !tbody) return;
+
+        if (strategyCode !== 'event_reversal_futures') {
+            panel.classList.add('hidden');
+            tbody.innerHTML = '<tr><td colspan="3" class="empty-state">暂无数据</td></tr>';
+            return;
+        }
+
+        panel.classList.remove('hidden');
+        const entries = Object.entries(exitReasonStats || {});
+        const labelMap = {
+            stop_loss: '止损出场',
+            take_profit: '止盈出场',
+            time_exit: '时间到期平仓',
+        };
+        if (!entries.length) {
+            tbody.innerHTML = '<tr><td colspan="3" class="empty-state">暂无数据</td></tr>';
+        } else {
+            tbody.innerHTML = entries.map(([reason, item]) => `
+                <tr>
+                    <td>${labelMap[reason] || reason}</td>
+                    <td>${this.formatInteger(item.count || 0)}</td>
+                    <td class="${Number(item.net_pnl || 0) > 0 ? 'text-success' : Number(item.net_pnl || 0) < 0 ? 'text-danger' : ''}">${this.formatCurrency(item.net_pnl || 0)}</td>
+                </tr>
+            `).join('');
+        }
+
+        document.getElementById('futuresPatternCandidates').textContent = this.formatInteger(metrics.pattern_candidates || 0);
+        document.getElementById('futuresTrendFiltered').textContent = this.formatInteger(metrics.trend_filtered || 0);
+        document.getElementById('futuresExecutedEntries').textContent = this.formatInteger(metrics.executed_entries || 0);
+    }
+
+    renderExecutionStats(stats, strategyCode) {
+        const panel = document.getElementById('executionStatsPanel');
+        if (!panel) return;
+        if (strategyCode !== 'event_reversal') {
+            panel.classList.add('hidden');
+            return;
+        }
+        panel.classList.remove('hidden');
+        document.getElementById('execPatternCandidates').textContent = this.formatInteger(stats.pattern_candidates || 0);
+        document.getElementById('execPreorderArmed').textContent = this.formatInteger(stats.preorder_armed || 0);
+        document.getElementById('execFinalConfirmed').textContent = this.formatInteger(stats.final_confirmed_entries || 0);
+        document.getElementById('execRecheckRejected').textContent = this.formatInteger(stats.recheck_rejected || 0);
+        document.getElementById('execCooldownRejected').textContent = this.formatInteger(stats.cooldown_rejected || 0);
+        document.getElementById('execBalanceRejected').textContent = this.formatInteger(stats.balance_rejected || 0);
+    }
+
+    renderHighRiskRounds(rounds, metrics, strategyCode) {
+        const panel = document.getElementById('highRiskRoundsPanel');
+        const list = document.getElementById('highRiskRoundsList');
+        if (!panel || !list) return;
+        if (strategyCode !== 'event_reversal') {
+            panel.classList.add('hidden');
+            list.innerHTML = '<div class="empty-state">暂无高风险轮次</div>';
+            return;
+        }
+        const filtered = (rounds || []).filter((round) => Number(round.levels_used || 0) >= 4);
+        panel.classList.remove('hidden');
+        document.getElementById('highRiskCount4').textContent = this.formatInteger(metrics.high_risk_rounds_4plus || 0);
+        document.getElementById('highRiskCount5').textContent = this.formatInteger(metrics.high_risk_rounds_5plus || 0);
+
+        if (!filtered.length) {
+            list.innerHTML = '<div class="empty-state">暂无高风险轮次</div>';
+            return;
+        }
+
+        list.innerHTML = filtered.map((round) => {
+            const reachedFive = Number(round.levels_used || 0) >= 5;
+            return `
+                <div class="ladder-round-card">
+                    <div class="ladder-round-header">
+                        <div class="ladder-round-title">第 ${round.round_id} 轮 · 打到第 ${round.levels_used} 层</div>
+                        <div class="ladder-round-badge ${reachedFive ? 'loss' : 'win'}">${reachedFive ? '五层风险' : '四层风险'}</div>
+                    </div>
+                    <div class="ladder-round-summary">
+                        <div class="ladder-round-summary-item">
+                            <span class="ladder-round-summary-label">总下注</span>
+                            <span class="ladder-round-summary-value">${this.formatCurrency(round.total_stake)}</span>
+                        </div>
+                        <div class="ladder-round-summary-item">
+                            <span class="ladder-round-summary-label">总手续费</span>
+                            <span class="ladder-round-summary-value">${this.formatCurrency(round.total_fee, 4)}</span>
+                        </div>
+                        <div class="ladder-round-summary-item">
+                            <span class="ladder-round-summary-label">本轮净盈亏</span>
+                            <span class="ladder-round-summary-value ${round.total_pnl > 0 ? 'text-success' : 'text-danger'}">${this.formatCurrency(round.total_pnl)}</span>
+                        </div>
+                    </div>
+                    <div class="ladder-steps">
+                        ${(round.steps || []).map((step) => `
+                            <div class="ladder-step">
+                                <div class="ladder-step-index">第${step.level}层</div>
+                                <div class="ladder-step-body">
+                                    <div class="ladder-step-main">${step.timestamp} · ${step.direction} · 下注 ${this.formatCurrency(step.stake)}</div>
+                                    <div class="ladder-step-sub">净盈亏 ${this.formatCurrency(step.pnl)} · ${step.won ? '该层胜出' : '继续推进'}</div>
+                                </div>
+                                <div class="ladder-step-result ${step.won ? 'text-success' : 'text-danger'}">${step.won ? '胜' : '负'}</div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
     exportBacktest(format) {
         const result = this.currentResult?.result;
         if (!result) {
@@ -432,6 +640,32 @@ class BacktestCenterApp {
         window.location.href = '/login';
     }
 
+    async deleteBacktestResult(resultId) {
+        if (!confirm('确定删除这条回测结果吗？')) {
+            return;
+        }
+        try {
+            const response = await fetch(`/api/backtest-results/${resultId}`, {
+                method: 'DELETE',
+                credentials: 'include'
+            });
+            const payload = response.ok ? await response.json() : await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(payload.error || '删除失败');
+            }
+            if (this.currentResult && this.currentResult.id === resultId) {
+                this.currentResult = null;
+                document.getElementById('backtestResults').classList.add('hidden');
+                document.getElementById('backtestEmptyState').classList.remove('hidden');
+                this.toggleExportButtons(false);
+            }
+            await this.loadBacktestResults();
+            await this.loadBacktestJobs();
+        } catch (error) {
+            alert(error.message || '删除失败');
+        }
+    }
+
     toggleTheme() {
         const currentTheme = document.documentElement.getAttribute('data-theme');
         const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
@@ -454,6 +688,43 @@ class BacktestCenterApp {
             fast_rule: '快速规则',
             full_ai: '完整AI'
         }[mode] || mode || '-';
+    }
+
+    renderIntervalText(item) {
+        const params = item.params || {};
+        const result = item.result || {};
+        const settings = result.settings || {};
+        return params.interval || params.timeframe || settings.interval || settings.timeframe || settings.base_timeframe || '-';
+    }
+
+    renderStrategyText(strategyCode) {
+        return {
+            ai_replay: 'AI回放',
+            event_reversal: '事件反转',
+            event_reversal_futures: '合约版反转'
+        }[strategyCode] || strategyCode || '-';
+    }
+
+    updateStrategyFields() {
+        const strategyCode = document.getElementById('strategyCode')?.value || 'ai_replay';
+        const eventFields = document.getElementById('eventStrategyFields');
+        const futuresFields = document.getElementById('futuresStrategyFields');
+        const aiMode = document.getElementById('backtestMode');
+        const decisionInterval = document.getElementById('backtestDecisionInterval');
+        const riskInterval = document.getElementById('backtestRiskInterval');
+        const maxAiCalls = document.getElementById('backtestMaxAiCalls');
+
+        if (eventFields) {
+            eventFields.classList.toggle('hidden', strategyCode !== 'event_reversal');
+        }
+        if (futuresFields) {
+            futuresFields.classList.toggle('hidden', strategyCode !== 'event_reversal_futures');
+        }
+        if (aiMode) aiMode.disabled = strategyCode !== 'ai_replay';
+        const disableAiFields = strategyCode !== 'ai_replay';
+        if (decisionInterval) decisionInterval.disabled = disableAiFields;
+        if (riskInterval) riskInterval.disabled = disableAiFields;
+        if (maxAiCalls) maxAiCalls.disabled = disableAiFields;
     }
 
     formatDateInput(date) {

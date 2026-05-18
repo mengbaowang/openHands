@@ -237,6 +237,7 @@ class Database:
                 user_id INTEGER NOT NULL,
                 model_id INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'queued',
+                strategy_code TEXT NOT NULL DEFAULT 'ai_replay',
                 mode TEXT NOT NULL DEFAULT 'candidate_ai',
                 start_date TEXT NOT NULL,
                 end_date TEXT NOT NULL,
@@ -244,6 +245,7 @@ class Database:
                 decision_interval_seconds INTEGER,
                 risk_interval_seconds INTEGER,
                 max_ai_calls INTEGER DEFAULT 2000,
+                params_json TEXT,
                 progress REAL DEFAULT 0,
                 current_step INTEGER DEFAULT 0,
                 total_steps INTEGER DEFAULT 0,
@@ -257,6 +259,14 @@ class Database:
                 FOREIGN KEY (model_id) REFERENCES models(id)
             )
         ''')
+        try:
+            cursor.execute("ALTER TABLE backtest_jobs ADD COLUMN strategy_code TEXT NOT NULL DEFAULT 'ai_replay'")
+        except:
+            pass
+        try:
+            cursor.execute("ALTER TABLE backtest_jobs ADD COLUMN params_json TEXT")
+        except:
+            pass
 
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS backtest_decision_cache (
@@ -280,12 +290,14 @@ class Database:
                 job_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 model_id INTEGER NOT NULL,
+                strategy_code TEXT NOT NULL DEFAULT 'ai_replay',
                 mode TEXT NOT NULL,
                 start_date TEXT NOT NULL,
                 end_date TEXT NOT NULL,
                 initial_capital REAL NOT NULL,
                 final_value REAL NOT NULL,
                 total_return REAL NOT NULL,
+                params_json TEXT,
                 summary_json TEXT,
                 metrics_json TEXT,
                 result_json TEXT NOT NULL,
@@ -295,6 +307,14 @@ class Database:
                 FOREIGN KEY (model_id) REFERENCES models(id)
             )
         ''')
+        try:
+            cursor.execute("ALTER TABLE backtest_results ADD COLUMN strategy_code TEXT NOT NULL DEFAULT 'ai_replay'")
+        except:
+            pass
+        try:
+            cursor.execute("ALTER TABLE backtest_results ADD COLUMN params_json TEXT")
+        except:
+            pass
         
         conn.commit()
         conn.close()
@@ -800,21 +820,22 @@ class Database:
 
     # ============ Backtest Jobs ============
 
-    def create_backtest_job(self, user_id: int, model_id: int, mode: str, start_date: str, end_date: str,
+    def create_backtest_job(self, user_id: int, model_id: int, strategy_code: str, mode: str, start_date: str, end_date: str,
                             initial_capital: float, decision_interval_seconds: int = None,
                             risk_interval_seconds: int = None, max_ai_calls: int = 2000,
+                            params_json: str = None,
                             message: str = '已创建回测任务') -> int:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO backtest_jobs (
-                user_id, model_id, status, mode, start_date, end_date, initial_capital,
-                decision_interval_seconds, risk_interval_seconds, max_ai_calls, message
+                user_id, model_id, status, strategy_code, mode, start_date, end_date, initial_capital,
+                decision_interval_seconds, risk_interval_seconds, max_ai_calls, params_json, message
             )
-            VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            user_id, model_id, mode, start_date, end_date, initial_capital,
-            decision_interval_seconds, risk_interval_seconds, max_ai_calls, message
+            user_id, model_id, strategy_code, mode, start_date, end_date, initial_capital,
+            decision_interval_seconds, risk_interval_seconds, max_ai_calls, params_json, message
         ))
         job_id = cursor.lastrowid
         conn.commit()
@@ -825,7 +846,7 @@ class Database:
         if not fields:
             return
         allowed = {
-            'status', 'mode', 'progress', 'current_step', 'total_steps', 'message',
+            'status', 'strategy_code', 'mode', 'params_json', 'progress', 'current_step', 'total_steps', 'message',
             'error', 'result_json', 'completed_at'
         }
         updates = []
@@ -889,6 +910,34 @@ class Database:
         conn.close()
         return [dict(row) for row in rows]
 
+    def cleanup_orphan_backtest_jobs(self, user_id: int, model_id: int = None) -> int:
+        """Delete finished backtest jobs that have no linked result row."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if model_id is not None:
+            cursor.execute('''
+                DELETE FROM backtest_jobs
+                WHERE user_id = ?
+                  AND model_id = ?
+                  AND status IN ('completed', 'failed')
+                  AND id NOT IN (
+                      SELECT job_id FROM backtest_results WHERE job_id IS NOT NULL
+                  )
+            ''', (user_id, model_id))
+        else:
+            cursor.execute('''
+                DELETE FROM backtest_jobs
+                WHERE user_id = ?
+                  AND status IN ('completed', 'failed')
+                  AND id NOT IN (
+                      SELECT job_id FROM backtest_results WHERE job_id IS NOT NULL
+                  )
+            ''', (user_id,))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
+
     def get_backtest_decision_cache(self, model_id: int, mode: str, fingerprint: str) -> Optional[Dict]:
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -923,22 +972,23 @@ class Database:
         conn.commit()
         conn.close()
 
-    def add_backtest_result(self, job_id: int, user_id: int, model_id: int, mode: str,
+    def add_backtest_result(self, job_id: int, user_id: int, model_id: int, strategy_code: str, mode: str,
                             start_date: str, end_date: str, initial_capital: float,
                             final_value: float, total_return: float,
+                            params_json: str = None,
                             summary_json: str = None, metrics_json: str = None,
                             result_json: str = None) -> int:
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO backtest_results (
-                job_id, user_id, model_id, mode, start_date, end_date, initial_capital,
-                final_value, total_return, summary_json, metrics_json, result_json
+                job_id, user_id, model_id, strategy_code, mode, start_date, end_date, initial_capital,
+                final_value, total_return, params_json, summary_json, metrics_json, result_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
-            job_id, user_id, model_id, mode, start_date, end_date, initial_capital,
-            final_value, total_return, summary_json, metrics_json, result_json
+            job_id, user_id, model_id, strategy_code, mode, start_date, end_date, initial_capital,
+            final_value, total_return, params_json, summary_json, metrics_json, result_json
         ))
         result_id = cursor.lastrowid
         conn.commit()
@@ -973,6 +1023,20 @@ class Database:
         row = cursor.fetchone()
         conn.close()
         return dict(row) if row else None
+
+    def delete_backtest_result(self, result_id: int):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM backtest_results WHERE id = ?', (result_id,))
+        conn.commit()
+        conn.close()
+
+    def delete_backtest_job(self, job_id: int):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM backtest_jobs WHERE id = ?', (job_id,))
+        conn.commit()
+        conn.close()
 
 
     def get_portfolio(self, model_id: int, current_prices: Dict = None) -> Dict:

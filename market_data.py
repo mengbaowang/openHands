@@ -22,7 +22,8 @@ class MarketDataFetcher:
 
     def __init__(self):
         self.okx_base_url = config.OKX_API_URL
-        self.okx_symbols = {
+        self.binance_futures_base_url = 'https://fapi.binance.com'
+        self.okx_spot_symbols = {
             'BTC': 'BTC-USDT',
             'ETH': 'ETH-USDT',
             'SOL': 'SOL-USDT',
@@ -31,6 +32,8 @@ class MarketDataFetcher:
             'DOGE': 'DOGE-USDT',
             'ZEC': 'ZEC-USDT',
         }
+        self.okx_swap_symbols = dict(config.OKX_SYMBOLS)
+        self.okx_symbols = self.okx_spot_symbols
         self._cache = {}
         self._cache_time = {}
         self._cache_duration = config.MARKET_API_CACHE_DURATION
@@ -66,110 +69,173 @@ class MarketDataFetcher:
         except Exception:
             pass
 
-    def get_current_prices(self, coins: List[str]) -> Dict[str, float]:
+    def _get_inst_candidates(self, coin: str) -> List[str]:
+        candidates = []
+        for inst_id in (
+            self.okx_swap_symbols.get(coin),
+            self.okx_spot_symbols.get(coin),
+        ):
+            if inst_id and inst_id not in candidates:
+                candidates.append(inst_id)
+        return candidates
+
+    def _request_okx_json(self, path: str, params: Dict, timeout: int = 8,
+                          retries: int = 2, rate_limit_source: str = 'okx') -> Optional[Dict]:
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                self._rate_limit(rate_limit_source)
+                response = requests.get(
+                    f"{self.okx_base_url}{path}",
+                    params=params,
+                    timeout=timeout
+                )
+                response.raise_for_status()
+                data = response.json()
+                if data.get('code') == '0':
+                    return data
+                last_error = data.get('msg') or f"code={data.get('code')}"
+            except Exception as e:
+                last_error = str(e)
+            if attempt < retries:
+                time.sleep(min(1.5 * (attempt + 1), 3.0))
+        return None
+
+    def get_current_prices(self, coins: List[str]) -> Dict[str, Dict[str, float]]:
         cache_key = 'prices_' + '_'.join(sorted(coins))
         if cache_key in self._cache and time.time() - self._cache_time[cache_key] < self._cache_duration:
             return self._cache[cache_key]
 
         prices = self._get_prices_from_okx(coins)
-        if prices and len(prices) == len(coins):
+        if prices:
             self._cache[cache_key] = prices
             self._cache_time[cache_key] = time.time()
+            self._save_persistent_cache()
             return prices
 
         if cache_key in self._cache and time.time() - self._cache_time[cache_key] < 2592000:
-            return self._cache[cache_key]
+            cached = dict(self._cache[cache_key])
+            if prices:
+                cached.update(prices)
+            return cached
 
-        return {}
+        return prices or {}
 
-    def _get_prices_from_okx(self, coins: List[str]) -> Optional[Dict[str, float]]:
-        try:
-            self._rate_limit('okx')
-            response = requests.get(
-                f"{self.okx_base_url}/market/tickers",
-                params={'instType': 'SWAP'},
-                timeout=8
-            )
-            response.raise_for_status()
-            data = response.json()
-            if data.get('code') != '0' or not data.get('data'):
-                return None
-
-            ticker_map = {item.get('instId'): item for item in data.get('data', []) if item.get('instId')}
-            prices = {}
-            for coin in coins:
-                inst_id = self.okx_symbols.get(coin)
-                item = ticker_map.get(inst_id)
-                if not item:
-                    continue
-                open_24h = float(item.get('open24h', 0) or 0)
-                last_price = float(item.get('last', 0) or 0)
-                change_24h = ((last_price - open_24h) / open_24h * 100) if open_24h > 0 else 0
-                prices[coin] = {'price': last_price, 'change_24h': change_24h}
-            return prices if prices else None
-        except Exception:
+    def _ticker_to_price_payload(self, item: Dict) -> Optional[Dict[str, float]]:
+        if not item:
             return None
+        last_price = float(item.get('last', 0) or 0)
+        if last_price <= 0:
+            return None
+        open_24h = float(item.get('open24h', 0) or 0)
+        change_24h = ((last_price - open_24h) / open_24h * 100) if open_24h > 0 else 0
+        return {'price': last_price, 'change_24h': change_24h}
+
+    def _fallback_price_from_cached_candles(self, coin: str) -> Optional[Dict[str, float]]:
+        candle_keys = [
+            f'candles_{coin}_5m_{self.TIMEFRAME_CONFIG["5m"]["points"]}',
+            f'candles_{coin}_15m_{self.TIMEFRAME_CONFIG["15m"]["points"]}',
+            f'candles_{coin}_1h_{self.TIMEFRAME_CONFIG["1h"]["points"]}',
+        ]
+        latest_candle = None
+        latest_ts = -1
+        for key in candle_keys:
+            candles = self._cache.get(key) or []
+            if candles:
+                candidate = candles[-1]
+                ts = int(candidate.get('timestamp', 0) or 0)
+                if ts > latest_ts:
+                    latest_candle = candidate
+                    latest_ts = ts
+        if not latest_candle:
+            return None
+        price = float(latest_candle.get('close', latest_candle.get('price', 0)) or 0)
+        if price <= 0:
+            return None
+        return {'price': price, 'change_24h': 0}
+
+    def _get_prices_from_okx(self, coins: List[str]) -> Optional[Dict[str, Dict[str, float]]]:
+        prices: Dict[str, Dict[str, float]] = {}
+        swap_tickers = self._request_okx_json('/market/tickers', {'instType': 'SWAP'}, timeout=8, retries=1)
+        ticker_map = {
+            item.get('instId'): item
+            for item in (swap_tickers or {}).get('data', [])
+            if item.get('instId')
+        }
+
+        for coin in coins:
+            for inst_id in self._get_inst_candidates(coin):
+                item = ticker_map.get(inst_id)
+                if item:
+                    payload = self._ticker_to_price_payload(item)
+                    if payload:
+                        prices[coin] = payload
+                        break
+            if coin in prices:
+                continue
+
+            for inst_id in self._get_inst_candidates(coin):
+                ticker = self._request_okx_json('/market/ticker', {'instId': inst_id}, timeout=8, retries=1)
+                data = (ticker or {}).get('data', [])
+                payload = self._ticker_to_price_payload(data[0] if data else {})
+                if payload:
+                    prices[coin] = payload
+                    break
+
+            if coin not in prices:
+                cached_payload = self._fallback_price_from_cached_candles(coin)
+                if cached_payload:
+                    prices[coin] = cached_payload
+
+        return prices if prices else None
 
     def _get_historical_from_okx(self, coin: str, days: int) -> Optional[List[Dict]]:
-        try:
-            self._rate_limit('okx')
-            inst_id = self.okx_symbols.get(coin)
-            if not inst_id:
-                return None
-            bar = '1Dutc' if days > 7 else '1H'
-            limit = min(days if days > 7 else days * 24, 300)
-            response = requests.get(
-                f"{self.okx_base_url}/market/history-candles",
-                params={'instId': inst_id, 'bar': bar, 'limit': limit},
-                timeout=8
+        bar = '1Dutc' if days > 7 else '1H'
+        limit = min(days if days > 7 else days * 24, 300)
+        for inst_id in self._get_inst_candidates(coin):
+            data = self._request_okx_json(
+                '/market/history-candles',
+                {'instId': inst_id, 'bar': bar, 'limit': limit},
+                timeout=8,
+                retries=1
             )
-            response.raise_for_status()
-            data = response.json()
-            if data.get('code') != '0':
-                return None
-            return [{'timestamp': int(c[0]), 'price': float(c[4])} for c in reversed(data.get('data', []))]
-        except Exception:
-            return None
+            if data and data.get('data'):
+                return [{'timestamp': int(c[0]), 'price': float(c[4])} for c in reversed(data.get('data', []))]
+        return None
 
     def _get_candles_from_okx(self, coin: str, timeframe: str, limit: int) -> Optional[List[Dict]]:
-        try:
-            self._rate_limit('okx')
-            inst_id = self.okx_symbols.get(coin)
-            tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
-            if not inst_id or not tf_config:
-                return None
-            response = requests.get(
-                f"{self.okx_base_url}/market/history-candles",
-                params={'instId': inst_id, 'bar': tf_config['okx'], 'limit': min(limit, 300)},
-                timeout=8
-            )
-            response.raise_for_status()
-            data = response.json()
-            if data.get('code') != '0':
-                return None
-            return [
-                {
-                    'timestamp': int(c[0]),
-                    'open': float(c[1]),
-                    'high': float(c[2]),
-                    'low': float(c[3]),
-                    'close': float(c[4]),
-                    'price': float(c[4]),
-                    'volume': float(c[5]),
-                }
-                for c in reversed(data.get('data', []))
-            ]
-        except Exception:
+        tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
+        if not tf_config:
             return None
+        for inst_id in self._get_inst_candidates(coin):
+            data = self._request_okx_json(
+                '/market/history-candles',
+                {'instId': inst_id, 'bar': tf_config['okx'], 'limit': min(limit, 300)},
+                timeout=8,
+                retries=1
+            )
+            if data and data.get('data'):
+                return [
+                    {
+                        'timestamp': int(c[0]),
+                        'open': float(c[1]),
+                        'high': float(c[2]),
+                        'low': float(c[3]),
+                        'close': float(c[4]),
+                        'price': float(c[4]),
+                        'volume': float(c[5]),
+                    }
+                    for c in reversed(data.get('data', []))
+                ]
+        return None
 
     def _get_candles_page_from_okx(self, coin: str, timeframe: str, limit: int,
                                    after: int = None, before: int = None) -> Optional[List[Dict]]:
-        try:
-            inst_id = self.okx_symbols.get(coin)
-            tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
-            if not inst_id or not tf_config:
-                return None
+        tf_config = self.TIMEFRAME_CONFIG.get(timeframe)
+        if not tf_config:
+            return None
 
+        for inst_id in self._get_inst_candidates(coin):
             params = {
                 'instId': inst_id,
                 'bar': tf_config['okx'],
@@ -180,30 +246,26 @@ class MarketDataFetcher:
             if before is not None:
                 params['before'] = int(before)
 
-            response = requests.get(
-                f"{self.okx_base_url}/market/history-candles",
-                params=params,
-                timeout=12
+            data = self._request_okx_json(
+                '/market/history-candles',
+                params,
+                timeout=12,
+                retries=1
             )
-            response.raise_for_status()
-            data = response.json()
-            if data.get('code') != '0':
-                return None
-
-            return [
-                {
-                    'timestamp': int(c[0]),
-                    'open': float(c[1]),
-                    'high': float(c[2]),
-                    'low': float(c[3]),
-                    'close': float(c[4]),
-                    'price': float(c[4]),
-                    'volume': float(c[5]),
-                }
-                for c in data.get('data', [])
-            ]
-        except Exception:
-            return None
+            if data and data.get('data'):
+                return [
+                    {
+                        'timestamp': int(c[0]),
+                        'open': float(c[1]),
+                        'high': float(c[2]),
+                        'low': float(c[3]),
+                        'close': float(c[4]),
+                        'price': float(c[4]),
+                        'volume': float(c[5]),
+                    }
+                    for c in data.get('data', [])
+                ]
+        return None
 
     def get_market_data(self, coin: str) -> Dict:
         try:
@@ -319,6 +381,67 @@ class MarketDataFetcher:
         self._cache[cache_key] = pages
         self._cache_time[cache_key] = time.time()
         return pages
+
+    def get_binance_index_price_klines(self, pair: str, interval: str,
+                                       start_ts_ms: int, end_ts_ms: int,
+                                       limit: int = 1500) -> List[Dict]:
+        cache_key = f'binance_index_{pair}_{interval}_{int(start_ts_ms)}_{int(end_ts_ms)}'
+        if cache_key in self._cache and time.time() - self._cache_time[cache_key] < 21600:
+            return self._cache[cache_key]
+
+        results = []
+        seen = set()
+        cursor = int(start_ts_ms)
+        while cursor <= end_ts_ms:
+            try:
+                response = requests.get(
+                    f'{self.binance_futures_base_url}/fapi/v1/indexPriceKlines',
+                    params={
+                        'pair': pair,
+                        'interval': interval,
+                        'startTime': cursor,
+                        'endTime': int(end_ts_ms),
+                        'limit': min(int(limit), 1500),
+                    },
+                    timeout=12
+                )
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data, list) or not data:
+                    break
+
+                page_added = 0
+                last_open_time = None
+                for item in data:
+                    open_time = int(item[0])
+                    close_time = int(item[6])
+                    last_open_time = open_time
+                    if open_time in seen:
+                        continue
+                    seen.add(open_time)
+                    results.append({
+                        'timestamp': close_time,
+                        'open_time': open_time,
+                        'open': float(item[1]),
+                        'high': float(item[2]),
+                        'low': float(item[3]),
+                        'close': float(item[4]),
+                        'price': float(item[4]),
+                    })
+                    page_added += 1
+
+                if page_added == 0 or last_open_time is None:
+                    break
+                cursor = last_open_time + 1
+                if len(data) < min(int(limit), 1500):
+                    break
+            except Exception:
+                break
+
+        results.sort(key=lambda item: item['timestamp'])
+        self._cache[cache_key] = results
+        self._cache_time[cache_key] = time.time()
+        return results
 
     def calculate_technical_indicators(self, coin: str) -> Dict:
         candles = self.get_historical_candles(coin, timeframe='1h', limit=self.TIMEFRAME_CONFIG['1h']['points'])

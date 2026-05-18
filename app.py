@@ -21,6 +21,8 @@ from database import Database
 from services.risk_manager import RiskManager
 from services.backtester import Backtester
 from services.performance_analyzer import PerformanceAnalyzer
+from services.strategies.event_reversal_strategy import EventReversalStrategyBacktester
+from services.strategies.event_reversal_futures_strategy import EventReversalFuturesStrategyBacktester
 from utils.auth import hash_password, verify_password, login_required, get_current_user_id, set_current_user, clear_current_user
 from utils.timezone import get_current_utc_time_str, get_current_beijing_time_str, utc_to_beijing
 
@@ -201,6 +203,15 @@ def _serialize_backtest_job(job: Dict) -> Dict:
     else:
         payload['result'] = None
     payload.pop('result_json', None)
+    params_json = payload.get('params_json')
+    if params_json:
+        try:
+            payload['params'] = json.loads(params_json)
+        except Exception:
+            payload['params'] = None
+    else:
+        payload['params'] = None
+    payload.pop('params_json', None)
     return payload
 
 
@@ -208,7 +219,7 @@ def _serialize_backtest_result(row: Dict) -> Dict:
     if not row:
         return {}
     payload = dict(row)
-    for key in ('summary_json', 'metrics_json', 'result_json'):
+    for key in ('summary_json', 'metrics_json', 'result_json', 'params_json'):
         value = payload.get(key)
         parsed_key = key.replace('_json', '')
         if value:
@@ -232,9 +243,18 @@ def _create_backtester_for_model_config(model_config: Dict) -> Backtester:
     return Backtester(db, market_fetcher, ai_trader)
 
 
+def _create_strategy_backtester(strategy_code: str, model_config: Dict):
+    if strategy_code == 'event_reversal':
+        return EventReversalStrategyBacktester(market_fetcher)
+    if strategy_code == 'event_reversal_futures':
+        return EventReversalFuturesStrategyBacktester(market_fetcher)
+    return _create_backtester_for_model_config(model_config)
+
+
 def _run_backtest_job(job_id: int, model_config: Dict, start_date: str, end_date: str,
                       initial_capital: float, decision_interval_seconds: int,
-                      risk_interval_seconds: int, max_ai_calls: int, mode: str):
+                      risk_interval_seconds: int, max_ai_calls: int, mode: str,
+                      strategy_code: str, strategy_params: Dict):
     job_row = db.get_backtest_job(job_id) or {}
     user_id = int(job_row.get('user_id') or 0)
     model_id = int(job_row.get('model_id') or model_config.get('model_id') or 0)
@@ -251,18 +271,27 @@ def _run_backtest_job(job_id: int, model_config: Dict, start_date: str, end_date
 
     db.update_backtest_job(job_id, status='running', progress=0, message='开始准备历史数据')
     try:
-        local_backtester = _create_backtester_for_model_config(model_config)
-        result = local_backtester.run_backtest(
-            model_config,
-            start_date,
-            end_date,
-            initial_capital,
-            decision_interval_seconds=decision_interval_seconds,
-            risk_interval_seconds=risk_interval_seconds,
-            max_ai_calls=max_ai_calls,
-            mode=mode,
-            progress_callback=progress_callback,
-        )
+        local_backtester = _create_strategy_backtester(strategy_code, model_config)
+        if strategy_code in {'event_reversal', 'event_reversal_futures'}:
+            result = local_backtester.run_backtest(
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=initial_capital,
+                params=strategy_params,
+                progress_callback=progress_callback,
+            )
+        else:
+            result = local_backtester.run_backtest(
+                model_config,
+                start_date,
+                end_date,
+                initial_capital,
+                decision_interval_seconds=decision_interval_seconds,
+                risk_interval_seconds=risk_interval_seconds,
+                max_ai_calls=max_ai_calls,
+                mode=mode,
+                progress_callback=progress_callback,
+            )
         result_json = json.dumps(result, ensure_ascii=False)
         db.update_backtest_job(
             job_id,
@@ -280,12 +309,14 @@ def _run_backtest_job(job_id: int, model_config: Dict, start_date: str, end_date
                 job_id=job_id,
                 user_id=user_id,
                 model_id=model_id,
+                strategy_code=strategy_code,
                 mode=mode,
                 start_date=start_date,
                 end_date=end_date,
                 initial_capital=initial_capital,
                 final_value=float(result.get('final_value', 0) or 0),
                 total_return=float(result.get('total_return', 0) or 0),
+                params_json=json.dumps(strategy_params or {}, ensure_ascii=False),
                 summary_json=json.dumps(result.get('summary', {}), ensure_ascii=False),
                 metrics_json=json.dumps(result.get('metrics', {}), ensure_ascii=False),
                 result_json=result_json,
@@ -660,6 +691,9 @@ def create_backtest_job():
         return jsonify({'error': '无权访问此模型'}), 403
 
     model = db.get_model(model_id)
+    strategy_code = str(data.get('strategy_code') or 'ai_replay')
+    if strategy_code not in {'ai_replay', 'event_reversal', 'event_reversal_futures'}:
+        return jsonify({'error': '不支持的回测策略'}), 400
     mode = str(data.get('mode') or 'candidate_ai')
     if mode not in {'full_ai', 'candidate_ai', 'fast_rule'}:
         return jsonify({'error': '不支持的回测模式'}), 400
@@ -671,7 +705,7 @@ def create_backtest_job():
         'model_name': data.get('model_name') or (model.get('model_name') if model else None),
         'system_prompt': data.get('system_prompt') or (model.get('system_prompt') if model else None),
     }
-    if mode in {'full_ai', 'candidate_ai'} and (
+    if strategy_code == 'ai_replay' and mode in {'full_ai', 'candidate_ai'} and (
         not model_config['api_key'] or not model_config['api_url'] or not model_config['model_name']
     ):
         return jsonify({'error': 'AI回测模式缺少模型配置'}), 400
@@ -684,10 +718,12 @@ def create_backtest_job():
     decision_interval_seconds = data.get('decision_interval_seconds')
     risk_interval_seconds = data.get('risk_interval_seconds')
     max_ai_calls = int(data.get('max_ai_calls', 2000))
+    strategy_params = data.get('strategy_params') or {}
 
     job_id = db.create_backtest_job(
         user_id=user_id,
         model_id=model_id,
+        strategy_code=strategy_code,
         mode=mode,
         start_date=start_date,
         end_date=end_date,
@@ -695,6 +731,7 @@ def create_backtest_job():
         decision_interval_seconds=decision_interval_seconds,
         risk_interval_seconds=risk_interval_seconds,
         max_ai_calls=max_ai_calls,
+        params_json=json.dumps(strategy_params, ensure_ascii=False),
         message='任务已创建，等待后台执行'
     )
 
@@ -710,6 +747,8 @@ def create_backtest_job():
             risk_interval_seconds,
             max_ai_calls,
             mode,
+            strategy_code,
+            strategy_params,
         ),
         daemon=True
     )
@@ -737,6 +776,7 @@ def get_latest_backtest_job(model_id):
     user_id = get_current_user_id()
     if not _check_model_ownership(model_id, user_id):
         return jsonify({'error': '无权访问此模型'}), 403
+    db.cleanup_orphan_backtest_jobs(user_id, model_id=model_id)
     job = db.get_latest_backtest_job(user_id, model_id)
     return jsonify(_serialize_backtest_job(job) if job else {})
 
@@ -747,6 +787,7 @@ def get_model_backtest_jobs(model_id):
     user_id = get_current_user_id()
     if not _check_model_ownership(model_id, user_id):
         return jsonify({'error': '无权访问此模型'}), 403
+    db.cleanup_orphan_backtest_jobs(user_id, model_id=model_id)
     limit = int(request.args.get('limit', 20))
     jobs = db.get_backtest_jobs(user_id, model_id=model_id, limit=limit)
     return jsonify([_serialize_backtest_job(job) for job in jobs])
@@ -773,6 +814,22 @@ def get_backtest_result_detail(result_id):
     if row.get('user_id') != user_id:
         return jsonify({'error': '无权访问此回测结果'}), 403
     return jsonify(_serialize_backtest_result(row))
+
+
+@app.route('/api/backtest-results/<int:result_id>', methods=['DELETE'])
+@login_required
+def delete_backtest_result(result_id):
+    user_id = get_current_user_id()
+    row = db.get_backtest_result_by_id(result_id)
+    if not row:
+        return jsonify({'error': '回测结果不存在'}), 404
+    if row.get('user_id') != user_id:
+        return jsonify({'error': '无权删除此回测结果'}), 403
+    job_id = row.get('job_id')
+    db.delete_backtest_result(result_id)
+    if job_id:
+        db.delete_backtest_job(int(job_id))
+    return jsonify({'success': True, 'deleted_id': result_id})
 
 @app.route('/api/models/<int:model_id>/performance', methods=['GET'])
 @login_required
